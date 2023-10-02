@@ -1,0 +1,4 @@
+comment = 'JIT with asmjit.'
+default_version = '1.0.0'
+module_pathname = '$libdir/asmjit'
+relocatable = true
