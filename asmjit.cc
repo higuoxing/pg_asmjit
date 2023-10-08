@@ -1,4 +1,3 @@
-#include "portability/instr_time.h"
 #if __cplusplus > 199711L
 #define register // Deprecated in C++11.
 #endif           // #if __cplusplus > 199711L
@@ -14,10 +13,12 @@ extern "C" {
 #include "postgres.h"
 
 #include "executor/execExpr.h"
+#include "executor/tuptable.h"
 #include "fmgr.h"
 #include "jit/jit.h"
 #include "nodes/execnodes.h"
 #include "nodes/pg_list.h"
+#include "portability/instr_time.h"
 #include "utils/memutils.h"
 #include "utils/palloc.h"
 #include "utils/resowner.h"
@@ -136,12 +137,51 @@ static bool JitCompileExpr(ExprState *State) {
                 StateResnull = jit::x86::ptr(
                     expressionp, offsetof(ExprState, resnull), sizeof(bool));
 
+  /*
+   * econtext->ecxt_scantuple, econtext->ecxt_innertuple and
+   * econtext->ecxt_outertuple.
+   */
+  jit::x86::Mem EContextScantuple = jit::x86::ptr(
+                    econtextp, offsetof(ExprContext, ecxt_scantuple),
+                    sizeof(TupleTableSlot *)),
+                EContextInnertuple = jit::x86::ptr(
+                    econtextp, offsetof(ExprContext, ecxt_innertuple),
+                    sizeof(TupleTableSlot *)),
+                EContextOutertuple = jit::x86::ptr(
+                    econtextp, offsetof(ExprContext, ecxt_outertuple),
+                    sizeof(TupleTableSlot *));
+
+  /*
+   * econtext->ecxt_scantuple->tts_values, econtext->ext_scantuple->tts_isnull,
+   */
+  jit::x86::Gp ScantupleAddr = Jitcc.newUIntPtr(),
+               InnertupleAddr = Jitcc.newUIntPtr(),
+               OutertupleAddr = Jitcc.newUIntPtr();
+  Jitcc.mov(ScantupleAddr, EContextScantuple);
+  Jitcc.mov(InnertupleAddr, EContextInnertuple);
+  Jitcc.mov(OutertupleAddr, EContextOutertuple);
+  jit::x86::Mem
+      ScantupleValues = jit::x86::ptr(
+          ScantupleAddr, offsetof(TupleTableSlot, tts_values), sizeof(Datum *)),
+      ScantupleIsnulls = jit::x86::ptr(
+          ScantupleAddr, offsetof(TupleTableSlot, tts_isnull), sizeof(bool *)),
+      InnertupleValues =
+          jit::x86::ptr(InnertupleAddr, offsetof(TupleTableSlot, tts_values),
+                        sizeof(Datum *)),
+      InnertupleIsnulls = jit::x86::ptr(
+          InnertupleAddr, offsetof(TupleTableSlot, tts_isnull), sizeof(bool *)),
+      OutertupleValues =
+          jit::x86::ptr(OutertupleAddr, offsetof(TupleTableSlot, tts_values),
+                        sizeof(Datum *)),
+      OutertupleIsnulls = jit::x86::ptr(
+          OutertupleAddr, offsetof(TupleTableSlot, tts_isnull), sizeof(bool *));
+
   jit::Label *Opblocks =
       (jit::Label *)palloc(State->steps_len * sizeof(jit::Label));
-  for (size_t OpIndex = 0; OpIndex < State->steps_len; ++OpIndex)
+  for (int OpIndex = 0; OpIndex < State->steps_len; ++OpIndex)
     Opblocks[OpIndex] = Jitcc.newLabel();
 
-  for (size_t OpIndex = 0; OpIndex < State->steps_len; ++OpIndex) {
+  for (int OpIndex = 0; OpIndex < State->steps_len; ++OpIndex) {
     ExprEvalStep *Op = &State->steps[OpIndex];
     ExprEvalOp Opcode = ExecEvalStepOp(State, Op);
 
@@ -164,6 +204,90 @@ static bool JitCompileExpr(ExprState *State) {
       Jitcc.endFunc();
       break;
     }
+    case EEOP_INNER_FETCHSOME:
+    case EEOP_OUTER_FETCHSOME:
+    case EEOP_SCAN_FETCHSOME: {
+      /* Step should not have been generated. */
+      Assert(TtsOps != &TTSOpsVirtual);
+
+      jit::x86::Mem Slot =
+          Opcode == EEOP_INNER_FETCHSOME
+              ? EContextInnertuple
+              : (Opcode == EEOP_OUTER_FETCHSOME ? EContextOutertuple
+                                                : EContextScantuple);
+
+      /* Compute the address of Slot->tts_nvalid */
+      jit::x86::Gp SlotAddr = Jitcc.newUIntPtr();
+      Jitcc.mov(SlotAddr, Slot);
+      jit::x86::Mem TtsNvalidPtr = jit::x86::ptr(
+          SlotAddr, offsetof(TupleTableSlot, tts_nvalid), sizeof(AttrNumber));
+      jit::x86::Gp TtsNvalid = Jitcc.newInt16();
+      Jitcc.mov(TtsNvalid, TtsNvalidPtr);
+
+      /*
+       * Check if all required attributes are available, or whether deforming is
+       * required.
+       */
+      Jitcc.cmp(TtsNvalid, jit::imm(Op->d.fetch.last_var));
+      Jitcc.jge(Opblocks[OpIndex + 1]);
+
+      /*
+       * TODO: Add support for JITing the deforming process.
+       */
+      jit::InvokeNode *SlotGetSomeAttrsInt;
+      Jitcc.invoke(&SlotGetSomeAttrsInt, jit::imm(slot_getsomeattrs_int),
+                   jit::FuncSignatureT<void, TupleTableSlot *, int>());
+      SlotGetSomeAttrsInt->setArg(0, SlotAddr);
+      SlotGetSomeAttrsInt->setArg(1, jit::imm(Op->d.fetch.last_var));
+
+      /* Jump to the next op block. */
+      Jitcc.jmp(Opblocks[OpIndex + 1]);
+      break;
+    }
+
+    case EEOP_INNER_VAR:
+    case EEOP_OUTER_VAR:
+    case EEOP_SCAN_VAR: {
+      jit::x86::Mem SlotValues =
+          Opcode == EEOP_INNER_VAR
+              ? InnertupleValues
+              : (Opcode == EEOP_OUTER_VAR ? OutertupleValues : ScantupleValues);
+      jit::x86::Mem SlotIsnulls =
+          Opcode == EEOP_INNER_VAR
+              ? InnertupleIsnulls
+              : (Opcode == EEOP_OUTER_VAR ? OutertupleIsnulls
+                                          : ScantupleIsnulls);
+      jit::x86::Gp SlotValuesAddr = Jitcc.newUIntPtr(),
+                   SlotIsnullsAddr = Jitcc.newUIntPtr();
+      Jitcc.mov(SlotValuesAddr, SlotValues);
+      Jitcc.mov(SlotIsnullsAddr, SlotIsnulls);
+
+      int Attrnum = Op->d.var.attnum;
+      jit::x86::Mem SlotValuePtr =
+          jit::x86::ptr(SlotValuesAddr, Attrnum * sizeof(Datum), sizeof(Datum));
+      jit::x86::Mem SlotIsnullPtr =
+          jit::x86::ptr(SlotIsnullsAddr, Attrnum * sizeof(bool), sizeof(bool));
+
+      jit::x86::Gp SlotValue = Jitcc.newUIntPtr(), SlotIsnull = Jitcc.newInt8();
+      Jitcc.mov(SlotValue, SlotValuePtr);
+      Jitcc.mov(SlotIsnull, SlotIsnullPtr);
+
+      /* Compute the addresses of op->resvalue and op->resnull */
+      jit::x86::Gp ResvalueAddr = Jitcc.newUIntPtr();
+      jit::x86::Gp ResnullAddr = Jitcc.newUIntPtr();
+      Jitcc.mov(ResvalueAddr, jit::imm(Op->resvalue));
+      Jitcc.mov(ResnullAddr, jit::imm(Op->resnull));
+      jit::x86::Mem Resvalue = jit::x86::ptr(ResvalueAddr, 0, sizeof(Datum));
+      jit::x86::Mem Resnull = jit::x86::ptr(ResnullAddr, 0, sizeof(bool));
+
+      Jitcc.mov(Resvalue, SlotValue);
+      Jitcc.mov(Resnull, SlotIsnull);
+
+      /* Jump to the next op block. */
+      Jitcc.jmp(Opblocks[OpIndex + 1]);
+      break;
+    }
+
     case EEOP_ASSIGN_TMP: {
       size_t ResultNum = Op->d.assign_tmp.resultnum;
 
@@ -211,6 +335,7 @@ static bool JitCompileExpr(ExprState *State) {
       Jitcc.mov(TtsValue, TempStateResvalue);
       Jitcc.mov(TtsIsnull, TempStateResnull);
 
+      /* Jump to the next op block. */
       Jitcc.jmp(Opblocks[OpIndex + 1]);
       break;
     }
@@ -235,9 +360,127 @@ static bool JitCompileExpr(ExprState *State) {
       Jitcc.mov(Resvalue, ConstVal);
       Jitcc.mov(Resnull, ConstNull);
 
+      /* Jump to the next op block. */
       Jitcc.jmp(Opblocks[OpIndex + 1]);
       break;
     }
+
+    case EEOP_FUNCEXPR:
+    case EEOP_FUNCEXPR_STRICT: {
+      FunctionCallInfo FuncCallInfo = Op->d.func.fcinfo_data;
+
+      /*
+       * Compute the addresses of Op->resvalue and Op->resnull.
+       */
+      jit::x86::Gp ResvalueAddr = Jitcc.newUIntPtr(),
+                   ResnullAddr = Jitcc.newUIntPtr();
+      Jitcc.mov(ResvalueAddr, jit::imm(Op->resvalue));
+      Jitcc.mov(ResnullAddr, jit::imm(Op->resnull));
+      jit::x86::Mem ResvaluePtr = jit::x86::ptr(ResvalueAddr, 0, sizeof(Datum)),
+                    ResnullPtr = jit::x86::ptr(ResnullAddr, 0, sizeof(bool));
+
+      jit::x86::Gp FuncCallInfoAddr = Jitcc.newUIntPtr();
+      Jitcc.mov(FuncCallInfoAddr, FuncCallInfo);
+
+      jit::Label InvokePGFunc = Jitcc.newLabel();
+
+      if (Opcode == EEOP_FUNCEXPR_STRICT) {
+	jit::Label StrictFail = Jitcc.newLabel();
+        /* Should make sure that they're optimized beforehand. */
+        int ArgsNum = Op->d.func.nargs;
+        if (ArgsNum == 0) {
+          ereport(ERROR,
+                  (errmsg("Argumentless strict functions are pointless")));
+        }
+
+        /* Check for NULL args for strict function. */
+        for (int ArgIndex = 0; ArgIndex < ArgsNum; ++ArgIndex) {
+          jit::x86::Mem FuncCallInfoArgNIsNullPtr =
+              jit::x86::ptr(FuncCallInfoAddr,
+                            offsetof(FunctionCallInfoBaseData, args) +
+                                ArgIndex * sizeof(NullableDatum) +
+                                offsetof(NullableDatum, isnull),
+                            sizeof(bool));
+          jit::x86::Gp FuncCallInfoArgNIsNull = Jitcc.newInt8();
+          Jitcc.mov(FuncCallInfoArgNIsNull, FuncCallInfoArgNIsNullPtr);
+          Jitcc.cmp(FuncCallInfoArgNIsNull, jit::imm(1));
+          Jitcc.je(StrictFail);
+        }
+
+	Jitcc.jmp(InvokePGFunc);
+	
+	Jitcc.bind(StrictFail);
+	/* Op->resnull = true */
+	Jitcc.mov(ResnullPtr, jit::imm(1));
+	Jitcc.jmp(Opblocks[OpIndex + 1]);
+      }
+
+      /*
+       * Before invoking PGFuncs, we should set FuncCallInfo->isnull to false.
+       */
+      Jitcc.bind(InvokePGFunc);
+      jit::x86::Mem FuncCallInfoIsNullPtr = jit::x86::ptr(
+          FuncCallInfoAddr, offsetof(FunctionCallInfoBaseData, isnull),
+          sizeof(bool));
+      Jitcc.mov(FuncCallInfoIsNullPtr, jit::imm(0));
+
+      jit::InvokeNode *PGFunc;
+      jit::x86::Gp RetValue = Jitcc.newUIntPtr();
+      Jitcc.invoke(&PGFunc, jit::imm(FuncCallInfo->flinfo->fn_addr),
+                   jit::FuncSignatureT<Datum, FunctionCallInfo>());
+      PGFunc->setArg(0, FuncCallInfo);
+      PGFunc->setRet(0, RetValue);
+
+      /* Write result values. */
+      Jitcc.mov(ResvaluePtr, RetValue);
+      jit::x86::Gp FuncCallInfoIsNull = Jitcc.newInt8();
+      Jitcc.mov(FuncCallInfoIsNull, FuncCallInfoIsNullPtr);
+      Jitcc.mov(ResnullPtr, FuncCallInfoIsNull);
+
+      /* Jump to the next op block. */
+      Jitcc.jmp(Opblocks[OpIndex + 1]);
+      break;
+    }
+
+    case EEOP_QUAL: {
+      jit::Label HandleNullOrFalse = Jitcc.newLabel();
+
+      jit::x86::Gp ResvalueAddr = Jitcc.newUIntPtr(),
+                   ResnullAddr = Jitcc.newUIntPtr();
+      Jitcc.mov(ResvalueAddr, jit::imm(Op->resvalue));
+      Jitcc.mov(ResnullAddr, jit::imm(Op->resnull));
+      jit::x86::Mem ResvaluePtr = jit::x86::ptr(ResvalueAddr, 0, sizeof(Datum)),
+                    ResnullPtr = jit::x86::ptr(ResnullAddr, 0, sizeof(bool));
+
+      jit::x86::Gp Resvalue = Jitcc.newUIntPtr(), Resnull = Jitcc.newInt8();
+      Jitcc.mov(Resvalue, ResvaluePtr);
+      Jitcc.mov(Resnull, ResnullPtr);
+
+      Jitcc.cmp(Resnull, jit::imm(1));
+      Jitcc.je(HandleNullOrFalse);
+
+      Jitcc.cmp(Resvalue, jit::imm(0));
+      Jitcc.je(HandleNullOrFalse);
+
+      Jitcc.jmp(Opblocks[OpIndex + 1]);
+
+      /* Handling null or false. */
+      Jitcc.bind(HandleNullOrFalse);
+
+      /* Set resnull and resvalue to false. */
+      Jitcc.mov(ResvaluePtr, jit::imm(0));
+      Jitcc.mov(ResnullPtr, jit::imm(0));
+
+      /* Jump to the next op block. */
+      Jitcc.jmp(Opblocks[OpIndex + 1]);
+      break;
+    }
+
+    case EEOP_LAST: {
+      Assert(false);
+      break;
+    }
+
     default:
       ereport(NOTICE,
               (errmsg("Jit for operator (%d) is not supported", Opcode)));
@@ -255,7 +498,7 @@ static bool JitCompileExpr(ExprState *State) {
   INSTR_TIME_ACCUM_DIFF(Context->base.instr.emission_counter,
                         CodeEmissionEndTime, CodeEmissionStartTime);
   if (err) {
-    ereport(NOTICE,
+    ereport(ERROR,
             (errmsg("Jit failed: %s", jit::DebugUtils::errorAsString(err))));
     return false;
   }
