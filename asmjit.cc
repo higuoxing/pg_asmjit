@@ -1,8 +1,11 @@
+#include "portability/instr_time.h"
 #if __cplusplus > 199711L
 #define register // Deprecated in C++11.
 #endif           // #if __cplusplus > 199711L
 
 #include <asmjit/asmjit.h>
+
+namespace jit = asmjit;
 
 #ifdef __cplusplus
 extern "C" {
@@ -23,14 +26,16 @@ extern "C" {
 PG_MODULE_MAGIC;
 
 static bool JitSessionInitialized = false;
-static asmjit::JitRuntime Runtime;
+static jit::JitRuntime Runtime;
 
 typedef struct AsmJitContext {
   JitContext base;
   List *funcs;
 } AsmJitContext;
 
-static void JitResetAfterError(void) { elog(NOTICE, "reset after error"); }
+static void JitResetAfterError(void) {
+  elog(NOTICE, "TODO: reset after error");
+}
 
 static void JitReleaseContext(JitContext *Ctx) {
   AsmJitContext *Context = (AsmJitContext *)Ctx;
@@ -41,7 +46,6 @@ static void JitReleaseContext(JitContext *Ctx) {
     Runtime.release(EvalFunc);
   }
   Context->funcs = NIL;
-  elog(NOTICE, "release context");
 }
 
 static void JitInitializeSession(void) {
@@ -86,6 +90,7 @@ static Datum ExecCompiledExpr(ExprState *State, ExprContext *EContext,
 static bool JitCompileExpr(ExprState *State) {
   PlanState *Parent = State->parent;
   AsmJitContext *Context = nullptr;
+  instr_time CodeGenStartTime, CodeGenEndTime;
 
   /*
    * Right now we don't support compiling expressions without a parent, as
@@ -101,21 +106,23 @@ static bool JitCompileExpr(ExprState *State) {
     Parent->state->es_jit = &Context->base;
   }
 
-  asmjit::CodeHolder Code;
+  INSTR_TIME_SET_CURRENT(CodeGenStartTime);
+
+  jit::CodeHolder Code;
   Code.init(Runtime.environment(), Runtime.cpuFeatures());
-  asmjit::x86::Compiler Jitcc(&Code);
+  jit::x86::Compiler Jitcc(&Code);
 
   /*
    * Datum ExprStateEvalFunc(struct ExprState *expression,
    *                         struct ExprContext *econtext,
    *                         bool *isNull);
    */
-  asmjit::FuncNode *JittedFunc = Jitcc.addFunc(
-      asmjit::FuncSignatureT<Datum, ExprState *, ExprContext *, bool *>());
+  jit::FuncNode *JittedFunc = Jitcc.addFunc(
+      jit::FuncSignatureT<Datum, ExprState *, ExprContext *, bool *>());
 
-  asmjit::x86::Gp expressionp = Jitcc.newUIntPtr("expression"),
-                  econtextp = Jitcc.newUIntPtr("econtext"),
-                  isnullp = Jitcc.newUIntPtr("isnull");
+  jit::x86::Gp expressionp = Jitcc.newUIntPtr("expression"),
+               econtextp = Jitcc.newUIntPtr("econtext"),
+               isnullp = Jitcc.newUIntPtr("isnull");
 
   JittedFunc->setArg(0, expressionp);
   JittedFunc->setArg(1, econtextp);
@@ -124,14 +131,13 @@ static bool JitCompileExpr(ExprState *State) {
   /*
    * expression->resvalue and expression->resnull.
    */
-  asmjit::x86::Mem StateResvalue = asmjit::x86::ptr(
-                       expressionp, offsetof(ExprState, resvalue),
-                       sizeof(Datum)),
-                   StateResnull = asmjit::x86::ptr(
-                       expressionp, offsetof(ExprState, resnull), sizeof(bool));
+  jit::x86::Mem StateResvalue = jit::x86::ptr(
+                    expressionp, offsetof(ExprState, resvalue), sizeof(Datum)),
+                StateResnull = jit::x86::ptr(
+                    expressionp, offsetof(ExprState, resnull), sizeof(bool));
 
-  asmjit::Label *Opblocks =
-      (asmjit::Label *)palloc(State->steps_len * sizeof(asmjit::Label));
+  jit::Label *Opblocks =
+      (jit::Label *)palloc(State->steps_len * sizeof(jit::Label));
   for (size_t OpIndex = 0; OpIndex < State->steps_len; ++OpIndex)
     Opblocks[OpIndex] = Jitcc.newLabel();
 
@@ -144,13 +150,13 @@ static bool JitCompileExpr(ExprState *State) {
     switch (Opcode) {
     case EEOP_DONE: {
       /* Load expression->resvalue and expression->resnull */
-      asmjit::x86::Gp TempStateResvalue = Jitcc.newUIntPtr(),
-                      TempStateResnull = Jitcc.newInt8();
+      jit::x86::Gp TempStateResvalue = Jitcc.newUIntPtr(),
+                   TempStateResnull = Jitcc.newInt8();
       Jitcc.mov(TempStateResvalue, StateResvalue);
       Jitcc.mov(TempStateResnull, StateResnull);
 
       /* *isnull = expression->resnull */
-      asmjit::x86::Mem IsNull = asmjit::x86::ptr(isnullp, 0, sizeof(bool));
+      jit::x86::Mem IsNull = jit::x86::ptr(isnullp, 0, sizeof(bool));
       Jitcc.mov(IsNull, TempStateResnull);
 
       /* return expression->resvalue */
@@ -162,8 +168,8 @@ static bool JitCompileExpr(ExprState *State) {
       size_t ResultNum = Op->d.assign_tmp.resultnum;
 
       /* Load expression->resvalue and expression->resnull */
-      asmjit::x86::Gp TempStateResvalue = Jitcc.newUIntPtr(),
-                      TempStateResnull = Jitcc.newInt8();
+      jit::x86::Gp TempStateResvalue = Jitcc.newUIntPtr(),
+                   TempStateResnull = Jitcc.newInt8();
       Jitcc.mov(TempStateResvalue, StateResvalue);
       Jitcc.mov(TempStateResnull, StateResnull);
 
@@ -171,29 +177,31 @@ static bool JitCompileExpr(ExprState *State) {
        * Compute the addresses of expression->resultslot->tts_values and
        * expression->resultslot->tts_isnull
        */
-      asmjit::x86::Mem StateResultslot =
-          asmjit::x86::ptr(expressionp, offsetof(ExprState, resultslot),
-                           sizeof(TupleTableSlot *));
-      asmjit::x86::Gp StateResultslotAddr = Jitcc.newUInt64();
+      jit::x86::Mem StateResultslot =
+          jit::x86::ptr(expressionp, offsetof(ExprState, resultslot),
+                        sizeof(TupleTableSlot *));
+      jit::x86::Gp StateResultslotAddr = Jitcc.newUInt64();
       Jitcc.mov(StateResultslotAddr, StateResultslot);
-      asmjit::x86::Mem TtsValues = asmjit::x86::ptr(
-                           StateResultslotAddr,
-                           offsetof(TupleTableSlot, tts_values),
-                           sizeof(Datum *)),
-                       TtsIsnulls = asmjit::x86::ptr(
-                           StateResultslotAddr,
-                           offsetof(TupleTableSlot, tts_isnull),
-                           sizeof(bool *));
-      asmjit::x86::Gp TtsValueAddr = Jitcc.newUIntPtr(),
-                      TtsIsnullAddr = Jitcc.newUIntPtr();
+      jit::x86::Mem TtsValues = jit::x86::ptr(
+                        StateResultslotAddr,
+                        offsetof(TupleTableSlot, tts_values), sizeof(Datum *)),
+                    TtsIsnulls = jit::x86::ptr(
+                        StateResultslotAddr,
+                        offsetof(TupleTableSlot, tts_isnull), sizeof(bool *));
+
+      /*
+       * Compute the addresses of
+       * expression->resultslot->tts_values[ResultNum] and
+       * expression->resultslot->tts_isnull[ResultNum]
+       */
+      jit::x86::Gp TtsValueAddr = Jitcc.newUIntPtr(),
+                   TtsIsnullAddr = Jitcc.newUIntPtr();
       Jitcc.mov(TtsValueAddr, TtsValues);
       Jitcc.mov(TtsIsnullAddr, TtsIsnulls);
-      asmjit::x86::Mem TtsValue = asmjit::x86::ptr(TtsValueAddr,
-                                                   sizeof(Datum) * ResultNum,
-                                                   sizeof(Datum)),
-                       TtsIsnull = asmjit::x86::ptr(TtsIsnullAddr,
-                                                    sizeof(bool) * ResultNum,
-                                                    sizeof(bool));
+      jit::x86::Mem TtsValue = jit::x86::ptr(
+                        TtsValueAddr, sizeof(Datum) * ResultNum, sizeof(Datum)),
+                    TtsIsnull = jit::x86::ptr(
+                        TtsIsnullAddr, sizeof(bool) * ResultNum, sizeof(bool));
 
       /*
        * Store expression->resvalue and expression->resnull to
@@ -207,20 +215,18 @@ static bool JitCompileExpr(ExprState *State) {
       break;
     }
     case EEOP_CONST: {
-      asmjit::x86::Gp ConstVal = Jitcc.newUIntPtr(),
-                      ConstNull = Jitcc.newInt8();
+      jit::x86::Gp ConstVal = Jitcc.newUIntPtr(), ConstNull = Jitcc.newInt8();
 
-      Jitcc.mov(ConstVal, asmjit::imm(Op->d.constval.value));
-      Jitcc.mov(ConstNull, asmjit::imm(Op->d.constval.isnull));
+      Jitcc.mov(ConstVal, jit::imm(Op->d.constval.value));
+      Jitcc.mov(ConstNull, jit::imm(Op->d.constval.isnull));
 
       /* Compute the addresses of op->resvalue and op->resnull */
-      asmjit::x86::Gp ResvalueAddr = Jitcc.newUIntPtr();
-      asmjit::x86::Gp ResnullAddr = Jitcc.newUIntPtr();
-      Jitcc.mov(ResvalueAddr, asmjit::imm(Op->resvalue));
-      Jitcc.mov(ResnullAddr, asmjit::imm(Op->resnull));
-      asmjit::x86::Mem Resvalue =
-          asmjit::x86::ptr(ResvalueAddr, 0, sizeof(Datum));
-      asmjit::x86::Mem Resnull = asmjit::x86::ptr(ResnullAddr, 0, sizeof(bool));
+      jit::x86::Gp ResvalueAddr = Jitcc.newUIntPtr();
+      jit::x86::Gp ResnullAddr = Jitcc.newUIntPtr();
+      Jitcc.mov(ResvalueAddr, jit::imm(Op->resvalue));
+      Jitcc.mov(ResnullAddr, jit::imm(Op->resnull));
+      jit::x86::Mem Resvalue = jit::x86::ptr(ResvalueAddr, 0, sizeof(Datum));
+      jit::x86::Mem Resnull = jit::x86::ptr(ResnullAddr, 0, sizeof(bool));
 
       /*
        * Store Op->d.constval.value to Op->resvalue.
@@ -241,11 +247,16 @@ static bool JitCompileExpr(ExprState *State) {
 
   Jitcc.finalize();
 
+  instr_time CodeEmissionStartTime, CodeEmissionEndTime;
   ExprStateEvalFunc EvalFunc;
-  asmjit::Error err = Runtime.add(&EvalFunc, &Code);
+  INSTR_TIME_SET_CURRENT(CodeEmissionStartTime);
+  jit::Error err = Runtime.add(&EvalFunc, &Code);
+  INSTR_TIME_SET_CURRENT(CodeEmissionEndTime);
+  INSTR_TIME_ACCUM_DIFF(Context->base.instr.emission_counter,
+                        CodeEmissionEndTime, CodeEmissionStartTime);
   if (err) {
     ereport(NOTICE,
-            (errmsg("Jit failed: %s", asmjit::DebugUtils::errorAsString(err))));
+            (errmsg("Jit failed: %s", jit::DebugUtils::errorAsString(err))));
     return false;
   }
 
@@ -253,7 +264,12 @@ static bool JitCompileExpr(ExprState *State) {
     State->evalfunc = ExecCompiledExpr;
     State->evalfunc_private = (void *)EvalFunc;
     Context->funcs = lappend(Context->funcs, (void *)EvalFunc);
+    Context->base.instr.created_functions++;
   }
+
+  INSTR_TIME_SET_CURRENT(CodeGenEndTime);
+  INSTR_TIME_ACCUM_DIFF(Context->base.instr.generation_counter, CodeGenEndTime,
+                        CodeGenStartTime);
 
   return true;
 }
