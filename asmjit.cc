@@ -5,6 +5,7 @@
 #include <asmjit/asmjit.h>
 
 namespace jit = asmjit;
+namespace x86 = asmjit::x86;
 
 #ifdef __cplusplus
 extern "C" {
@@ -88,6 +89,56 @@ static Datum ExecCompiledExpr(ExprState *State, ExprContext *EContext,
   return Func(State, EContext, IsNull);
 }
 
+static pg_attribute_always_inline void
+ExecAggPlainTransByVal(AggState *aggstate, AggStatePerTrans pertrans,
+                       AggStatePerGroup pergroup, ExprContext *aggcontext,
+                       int setno) {
+  FunctionCallInfo fcinfo = pertrans->transfn_fcinfo;
+  MemoryContext oldContext;
+  Datum newVal;
+
+  /* cf. select_current_set() */
+  aggstate->curaggcontext = aggcontext;
+  aggstate->current_set = setno;
+
+  /* set up aggstate->curpertrans for AggGetAggref() */
+  aggstate->curpertrans = pertrans;
+
+  /* invoke transition function in per-tuple context */
+  oldContext =
+      MemoryContextSwitchTo(aggstate->tmpcontext->ecxt_per_tuple_memory);
+
+  fcinfo->args[0].value = pergroup->transValue;
+  fcinfo->args[0].isnull = pergroup->transValueIsNull;
+  fcinfo->isnull = false; /* just in case transfn doesn't set it */
+
+  newVal = FunctionCallInvoke(fcinfo);
+
+  pergroup->transValue = newVal;
+  pergroup->transValueIsNull = fcinfo->isnull;
+
+  MemoryContextSwitchTo(oldContext);
+}
+
+void InterpretAggPlainTransStrictByVal(ExprState *State, ExprEvalStep *Op) {
+  AggState *aggstate = castNode(AggState, State->parent);
+  AggStatePerTrans pertrans = Op->d.agg_trans.pertrans;
+  AggStatePerGroup pergroup =
+      &aggstate->all_pergroups[Op->d.agg_trans.setoff][Op->d.agg_trans.transno];
+
+  Assert(pertrans->transtypeByVal);
+
+  if (pergroup->noTransValue) {
+    /* If transValue has not yet been initialized, do so now. */
+    ExecAggInitGroup(aggstate, pertrans, pergroup, Op->d.agg_trans.aggcontext);
+    /* copied trans value from input, done this round */
+  } else if (likely(!pergroup->transValueIsNull)) {
+    /* invoke transition function, unless prevented by strictness */
+    ExecAggPlainTransByVal(aggstate, pertrans, pergroup,
+                           Op->d.agg_trans.aggcontext, Op->d.agg_trans.setno);
+  }
+}
+
 static bool JitCompileExpr(ExprState *State) {
   PlanState *Parent = State->parent;
   AsmJitContext *Context = nullptr;
@@ -111,7 +162,7 @@ static bool JitCompileExpr(ExprState *State) {
 
   jit::CodeHolder Code;
   Code.init(Runtime.environment(), Runtime.cpuFeatures());
-  jit::x86::Compiler Jitcc(&Code);
+  x86::Compiler Jitcc(&Code);
 
   /*
    * Datum ExprStateEvalFunc(struct ExprState *expression,
@@ -121,9 +172,9 @@ static bool JitCompileExpr(ExprState *State) {
   jit::FuncNode *JittedFunc = Jitcc.addFunc(
       jit::FuncSignatureT<Datum, ExprState *, ExprContext *, bool *>());
 
-  jit::x86::Gp expressionp = Jitcc.newUIntPtr("expression"),
-               econtextp = Jitcc.newUIntPtr("econtext"),
-               isnullp = Jitcc.newUIntPtr("isnull");
+  x86::Gp expressionp = Jitcc.newUIntPtr("expression"),
+          econtextp = Jitcc.newUIntPtr("econtext"),
+          isnullp = Jitcc.newUIntPtr("isnull");
 
   JittedFunc->setArg(0, expressionp);
   JittedFunc->setArg(1, econtextp);
@@ -132,49 +183,57 @@ static bool JitCompileExpr(ExprState *State) {
   /*
    * expression->resvalue and expression->resnull.
    */
-  jit::x86::Mem StateResvalue = jit::x86::ptr(
-                    expressionp, offsetof(ExprState, resvalue), sizeof(Datum)),
-                StateResnull = jit::x86::ptr(
-                    expressionp, offsetof(ExprState, resnull), sizeof(bool));
+  x86::Mem StateResvalue = x86::ptr(expressionp, offsetof(ExprState, resvalue),
+                                    sizeof(Datum)),
+           StateResnull = x86::ptr(expressionp, offsetof(ExprState, resnull),
+                                   sizeof(bool));
 
   /*
    * econtext->ecxt_scantuple, econtext->ecxt_innertuple and
    * econtext->ecxt_outertuple.
    */
-  jit::x86::Mem EContextScantuple = jit::x86::ptr(
-                    econtextp, offsetof(ExprContext, ecxt_scantuple),
-                    sizeof(TupleTableSlot *)),
-                EContextInnertuple = jit::x86::ptr(
-                    econtextp, offsetof(ExprContext, ecxt_innertuple),
-                    sizeof(TupleTableSlot *)),
-                EContextOutertuple = jit::x86::ptr(
-                    econtextp, offsetof(ExprContext, ecxt_outertuple),
-                    sizeof(TupleTableSlot *));
+  x86::Mem EContextScantuple =
+               x86::ptr(econtextp, offsetof(ExprContext, ecxt_scantuple),
+                        sizeof(TupleTableSlot *)),
+           EContextInnertuple =
+               x86::ptr(econtextp, offsetof(ExprContext, ecxt_innertuple),
+                        sizeof(TupleTableSlot *)),
+           EContextOutertuple =
+               x86::ptr(econtextp, offsetof(ExprContext, ecxt_outertuple),
+                        sizeof(TupleTableSlot *));
 
   /*
    * econtext->ecxt_scantuple->tts_values, econtext->ext_scantuple->tts_isnull,
    */
-  jit::x86::Gp ScantupleAddr = Jitcc.newUIntPtr(),
-               InnertupleAddr = Jitcc.newUIntPtr(),
-               OutertupleAddr = Jitcc.newUIntPtr();
+  x86::Gp ScantupleAddr = Jitcc.newUIntPtr(),
+          InnertupleAddr = Jitcc.newUIntPtr(),
+          OutertupleAddr = Jitcc.newUIntPtr();
   Jitcc.mov(ScantupleAddr, EContextScantuple);
   Jitcc.mov(InnertupleAddr, EContextInnertuple);
   Jitcc.mov(OutertupleAddr, EContextOutertuple);
-  jit::x86::Mem
-      ScantupleValues = jit::x86::ptr(
-          ScantupleAddr, offsetof(TupleTableSlot, tts_values), sizeof(Datum *)),
-      ScantupleIsnulls = jit::x86::ptr(
-          ScantupleAddr, offsetof(TupleTableSlot, tts_isnull), sizeof(bool *)),
-      InnertupleValues =
-          jit::x86::ptr(InnertupleAddr, offsetof(TupleTableSlot, tts_values),
+  x86::Mem ScantupleValues =
+               x86::ptr(ScantupleAddr, offsetof(TupleTableSlot, tts_values),
                         sizeof(Datum *)),
-      InnertupleIsnulls = jit::x86::ptr(
-          InnertupleAddr, offsetof(TupleTableSlot, tts_isnull), sizeof(bool *)),
-      OutertupleValues =
-          jit::x86::ptr(OutertupleAddr, offsetof(TupleTableSlot, tts_values),
+           ScantupleIsnulls =
+               x86::ptr(ScantupleAddr, offsetof(TupleTableSlot, tts_isnull),
+                        sizeof(bool *)),
+           InnertupleValues =
+               x86::ptr(InnertupleAddr, offsetof(TupleTableSlot, tts_values),
                         sizeof(Datum *)),
-      OutertupleIsnulls = jit::x86::ptr(
-          OutertupleAddr, offsetof(TupleTableSlot, tts_isnull), sizeof(bool *));
+           InnertupleIsnulls =
+               x86::ptr(InnertupleAddr, offsetof(TupleTableSlot, tts_isnull),
+                        sizeof(bool *)),
+           OutertupleValues =
+               x86::ptr(OutertupleAddr, offsetof(TupleTableSlot, tts_values),
+                        sizeof(Datum *)),
+           OutertupleIsnulls =
+               x86::ptr(OutertupleAddr, offsetof(TupleTableSlot, tts_isnull),
+                        sizeof(bool *));
+
+  x86::Mem ParentAddrPtr =
+      x86::ptr(expressionp, offsetof(ExprState, parent), sizeof(PlanState *));
+  x86::Gp ParentAddr = Jitcc.newUIntPtr();
+  Jitcc.mov(ParentAddr, ParentAddrPtr);
 
   jit::Label *Opblocks =
       (jit::Label *)palloc(State->steps_len * sizeof(jit::Label));
@@ -187,16 +246,22 @@ static bool JitCompileExpr(ExprState *State) {
 
     Jitcc.bind(Opblocks[OpIndex]);
 
+    x86::Gp ResvalueAddr = Jitcc.newUIntPtr(), ResnullAddr = Jitcc.newUIntPtr();
+    Jitcc.mov(ResvalueAddr, jit::imm(Op->resvalue));
+    Jitcc.mov(ResnullAddr, jit::imm(Op->resnull));
+    x86::Mem ResvaluePtr = x86::ptr(ResvalueAddr, 0, sizeof(Datum)),
+             ResnullPtr = x86::ptr(ResnullAddr, 0, sizeof(bool));
+
     switch (Opcode) {
     case EEOP_DONE: {
       /* Load expression->resvalue and expression->resnull */
-      jit::x86::Gp TempStateResvalue = Jitcc.newUIntPtr(),
-                   TempStateResnull = Jitcc.newInt8();
+      x86::Gp TempStateResvalue = Jitcc.newUIntPtr(),
+              TempStateResnull = Jitcc.newInt8();
       Jitcc.mov(TempStateResvalue, StateResvalue);
       Jitcc.mov(TempStateResnull, StateResnull);
 
       /* *isnull = expression->resnull */
-      jit::x86::Mem IsNull = jit::x86::ptr(isnullp, 0, sizeof(bool));
+      x86::Mem IsNull = x86::ptr(isnullp, 0, sizeof(bool));
       Jitcc.mov(IsNull, TempStateResnull);
 
       /* return expression->resvalue */
@@ -210,18 +275,18 @@ static bool JitCompileExpr(ExprState *State) {
       /* Step should not have been generated. */
       Assert(TtsOps != &TTSOpsVirtual);
 
-      jit::x86::Mem Slot =
+      x86::Mem Slot =
           Opcode == EEOP_INNER_FETCHSOME
               ? EContextInnertuple
               : (Opcode == EEOP_OUTER_FETCHSOME ? EContextOutertuple
                                                 : EContextScantuple);
 
       /* Compute the address of Slot->tts_nvalid */
-      jit::x86::Gp SlotAddr = Jitcc.newUIntPtr();
+      x86::Gp SlotAddr = Jitcc.newUIntPtr();
       Jitcc.mov(SlotAddr, Slot);
-      jit::x86::Mem TtsNvalidPtr = jit::x86::ptr(
+      x86::Mem TtsNvalidPtr = x86::ptr(
           SlotAddr, offsetof(TupleTableSlot, tts_nvalid), sizeof(AttrNumber));
-      jit::x86::Gp TtsNvalid = Jitcc.newInt16();
+      x86::Gp TtsNvalid = Jitcc.newInt16();
       Jitcc.mov(TtsNvalid, TtsNvalidPtr);
 
       /*
@@ -240,51 +305,39 @@ static bool JitCompileExpr(ExprState *State) {
       SlotGetSomeAttrsInt->setArg(0, SlotAddr);
       SlotGetSomeAttrsInt->setArg(1, jit::imm(Op->d.fetch.last_var));
 
-      /* Jump to the next op block. */
-      Jitcc.jmp(Opblocks[OpIndex + 1]);
       break;
     }
 
     case EEOP_INNER_VAR:
     case EEOP_OUTER_VAR:
     case EEOP_SCAN_VAR: {
-      jit::x86::Mem SlotValues =
+      x86::Mem SlotValues =
           Opcode == EEOP_INNER_VAR
               ? InnertupleValues
               : (Opcode == EEOP_OUTER_VAR ? OutertupleValues : ScantupleValues);
-      jit::x86::Mem SlotIsnulls =
+      x86::Mem SlotIsnulls =
           Opcode == EEOP_INNER_VAR
               ? InnertupleIsnulls
               : (Opcode == EEOP_OUTER_VAR ? OutertupleIsnulls
                                           : ScantupleIsnulls);
-      jit::x86::Gp SlotValuesAddr = Jitcc.newUIntPtr(),
-                   SlotIsnullsAddr = Jitcc.newUIntPtr();
+      x86::Gp SlotValuesAddr = Jitcc.newUIntPtr(),
+              SlotIsnullsAddr = Jitcc.newUIntPtr();
       Jitcc.mov(SlotValuesAddr, SlotValues);
       Jitcc.mov(SlotIsnullsAddr, SlotIsnulls);
 
       int Attrnum = Op->d.var.attnum;
-      jit::x86::Mem SlotValuePtr =
-          jit::x86::ptr(SlotValuesAddr, Attrnum * sizeof(Datum), sizeof(Datum));
-      jit::x86::Mem SlotIsnullPtr =
-          jit::x86::ptr(SlotIsnullsAddr, Attrnum * sizeof(bool), sizeof(bool));
+      x86::Mem SlotValuePtr =
+          x86::ptr(SlotValuesAddr, Attrnum * sizeof(Datum), sizeof(Datum));
+      x86::Mem SlotIsnullPtr =
+          x86::ptr(SlotIsnullsAddr, Attrnum * sizeof(bool), sizeof(bool));
 
-      jit::x86::Gp SlotValue = Jitcc.newUIntPtr(), SlotIsnull = Jitcc.newInt8();
+      x86::Gp SlotValue = Jitcc.newUIntPtr(), SlotIsnull = Jitcc.newInt8();
       Jitcc.mov(SlotValue, SlotValuePtr);
       Jitcc.mov(SlotIsnull, SlotIsnullPtr);
 
-      /* Compute the addresses of op->resvalue and op->resnull */
-      jit::x86::Gp ResvalueAddr = Jitcc.newUIntPtr();
-      jit::x86::Gp ResnullAddr = Jitcc.newUIntPtr();
-      Jitcc.mov(ResvalueAddr, jit::imm(Op->resvalue));
-      Jitcc.mov(ResnullAddr, jit::imm(Op->resnull));
-      jit::x86::Mem Resvalue = jit::x86::ptr(ResvalueAddr, 0, sizeof(Datum));
-      jit::x86::Mem Resnull = jit::x86::ptr(ResnullAddr, 0, sizeof(bool));
+      Jitcc.mov(ResvaluePtr, SlotValue);
+      Jitcc.mov(ResnullPtr, SlotIsnull);
 
-      Jitcc.mov(Resvalue, SlotValue);
-      Jitcc.mov(Resnull, SlotIsnull);
-
-      /* Jump to the next op block. */
-      Jitcc.jmp(Opblocks[OpIndex + 1]);
       break;
     }
 
@@ -292,8 +345,8 @@ static bool JitCompileExpr(ExprState *State) {
       size_t ResultNum = Op->d.assign_tmp.resultnum;
 
       /* Load expression->resvalue and expression->resnull */
-      jit::x86::Gp TempStateResvalue = Jitcc.newUIntPtr(),
-                   TempStateResnull = Jitcc.newInt8();
+      x86::Gp TempStateResvalue = Jitcc.newUIntPtr(),
+              TempStateResnull = Jitcc.newInt8();
       Jitcc.mov(TempStateResvalue, StateResvalue);
       Jitcc.mov(TempStateResnull, StateResnull);
 
@@ -301,31 +354,31 @@ static bool JitCompileExpr(ExprState *State) {
        * Compute the addresses of expression->resultslot->tts_values and
        * expression->resultslot->tts_isnull
        */
-      jit::x86::Mem StateResultslot =
-          jit::x86::ptr(expressionp, offsetof(ExprState, resultslot),
-                        sizeof(TupleTableSlot *));
-      jit::x86::Gp StateResultslotAddr = Jitcc.newUInt64();
+      x86::Mem StateResultslot =
+          x86::ptr(expressionp, offsetof(ExprState, resultslot),
+                   sizeof(TupleTableSlot *));
+      x86::Gp StateResultslotAddr = Jitcc.newUInt64();
       Jitcc.mov(StateResultslotAddr, StateResultslot);
-      jit::x86::Mem TtsValues = jit::x86::ptr(
-                        StateResultslotAddr,
-                        offsetof(TupleTableSlot, tts_values), sizeof(Datum *)),
-                    TtsIsnulls = jit::x86::ptr(
-                        StateResultslotAddr,
-                        offsetof(TupleTableSlot, tts_isnull), sizeof(bool *));
+      x86::Mem TtsValues = x86::ptr(StateResultslotAddr,
+                                    offsetof(TupleTableSlot, tts_values),
+                                    sizeof(Datum *)),
+               TtsIsnulls = x86::ptr(StateResultslotAddr,
+                                     offsetof(TupleTableSlot, tts_isnull),
+                                     sizeof(bool *));
 
       /*
        * Compute the addresses of
        * expression->resultslot->tts_values[ResultNum] and
        * expression->resultslot->tts_isnull[ResultNum]
        */
-      jit::x86::Gp TtsValueAddr = Jitcc.newUIntPtr(),
-                   TtsIsnullAddr = Jitcc.newUIntPtr();
+      x86::Gp TtsValueAddr = Jitcc.newUIntPtr(),
+              TtsIsnullAddr = Jitcc.newUIntPtr();
       Jitcc.mov(TtsValueAddr, TtsValues);
       Jitcc.mov(TtsIsnullAddr, TtsIsnulls);
-      jit::x86::Mem TtsValue = jit::x86::ptr(
-                        TtsValueAddr, sizeof(Datum) * ResultNum, sizeof(Datum)),
-                    TtsIsnull = jit::x86::ptr(
-                        TtsIsnullAddr, sizeof(bool) * ResultNum, sizeof(bool));
+      x86::Mem TtsValue = x86::ptr(TtsValueAddr, sizeof(Datum) * ResultNum,
+                                   sizeof(Datum)),
+               TtsIsnull = x86::ptr(TtsIsnullAddr, sizeof(bool) * ResultNum,
+                                    sizeof(bool));
 
       /*
        * Store expression->resvalue and expression->resnull to
@@ -335,33 +388,21 @@ static bool JitCompileExpr(ExprState *State) {
       Jitcc.mov(TtsValue, TempStateResvalue);
       Jitcc.mov(TtsIsnull, TempStateResnull);
 
-      /* Jump to the next op block. */
-      Jitcc.jmp(Opblocks[OpIndex + 1]);
       break;
     }
     case EEOP_CONST: {
-      jit::x86::Gp ConstVal = Jitcc.newUIntPtr(), ConstNull = Jitcc.newInt8();
+      x86::Gp ConstVal = Jitcc.newUIntPtr(), ConstNull = Jitcc.newInt8();
 
       Jitcc.mov(ConstVal, jit::imm(Op->d.constval.value));
       Jitcc.mov(ConstNull, jit::imm(Op->d.constval.isnull));
-
-      /* Compute the addresses of op->resvalue and op->resnull */
-      jit::x86::Gp ResvalueAddr = Jitcc.newUIntPtr();
-      jit::x86::Gp ResnullAddr = Jitcc.newUIntPtr();
-      Jitcc.mov(ResvalueAddr, jit::imm(Op->resvalue));
-      Jitcc.mov(ResnullAddr, jit::imm(Op->resnull));
-      jit::x86::Mem Resvalue = jit::x86::ptr(ResvalueAddr, 0, sizeof(Datum));
-      jit::x86::Mem Resnull = jit::x86::ptr(ResnullAddr, 0, sizeof(bool));
 
       /*
        * Store Op->d.constval.value to Op->resvalue.
        * Store Op->d.constval.isnull to Op->resnull.
        */
-      Jitcc.mov(Resvalue, ConstVal);
-      Jitcc.mov(Resnull, ConstNull);
+      Jitcc.mov(ResvaluePtr, ConstVal);
+      Jitcc.mov(ResnullPtr, ConstNull);
 
-      /* Jump to the next op block. */
-      Jitcc.jmp(Opblocks[OpIndex + 1]);
       break;
     }
 
@@ -369,23 +410,13 @@ static bool JitCompileExpr(ExprState *State) {
     case EEOP_FUNCEXPR_STRICT: {
       FunctionCallInfo FuncCallInfo = Op->d.func.fcinfo_data;
 
-      /*
-       * Compute the addresses of Op->resvalue and Op->resnull.
-       */
-      jit::x86::Gp ResvalueAddr = Jitcc.newUIntPtr(),
-                   ResnullAddr = Jitcc.newUIntPtr();
-      Jitcc.mov(ResvalueAddr, jit::imm(Op->resvalue));
-      Jitcc.mov(ResnullAddr, jit::imm(Op->resnull));
-      jit::x86::Mem ResvaluePtr = jit::x86::ptr(ResvalueAddr, 0, sizeof(Datum)),
-                    ResnullPtr = jit::x86::ptr(ResnullAddr, 0, sizeof(bool));
-
-      jit::x86::Gp FuncCallInfoAddr = Jitcc.newUIntPtr();
+      x86::Gp FuncCallInfoAddr = Jitcc.newUIntPtr();
       Jitcc.mov(FuncCallInfoAddr, FuncCallInfo);
 
       jit::Label InvokePGFunc = Jitcc.newLabel();
 
       if (Opcode == EEOP_FUNCEXPR_STRICT) {
-	jit::Label StrictFail = Jitcc.newLabel();
+        jit::Label StrictFail = Jitcc.newLabel();
         /* Should make sure that they're optimized beforehand. */
         int ArgsNum = Op->d.func.nargs;
         if (ArgsNum == 0) {
@@ -395,37 +426,37 @@ static bool JitCompileExpr(ExprState *State) {
 
         /* Check for NULL args for strict function. */
         for (int ArgIndex = 0; ArgIndex < ArgsNum; ++ArgIndex) {
-          jit::x86::Mem FuncCallInfoArgNIsNullPtr =
-              jit::x86::ptr(FuncCallInfoAddr,
-                            offsetof(FunctionCallInfoBaseData, args) +
-                                ArgIndex * sizeof(NullableDatum) +
-                                offsetof(NullableDatum, isnull),
-                            sizeof(bool));
-          jit::x86::Gp FuncCallInfoArgNIsNull = Jitcc.newInt8();
+          x86::Mem FuncCallInfoArgNIsNullPtr =
+              x86::ptr(FuncCallInfoAddr,
+                       offsetof(FunctionCallInfoBaseData, args) +
+                           ArgIndex * sizeof(NullableDatum) +
+                           offsetof(NullableDatum, isnull),
+                       sizeof(bool));
+          x86::Gp FuncCallInfoArgNIsNull = Jitcc.newInt8();
           Jitcc.mov(FuncCallInfoArgNIsNull, FuncCallInfoArgNIsNullPtr);
           Jitcc.cmp(FuncCallInfoArgNIsNull, jit::imm(1));
           Jitcc.je(StrictFail);
         }
 
-	Jitcc.jmp(InvokePGFunc);
-	
-	Jitcc.bind(StrictFail);
-	/* Op->resnull = true */
-	Jitcc.mov(ResnullPtr, jit::imm(1));
-	Jitcc.jmp(Opblocks[OpIndex + 1]);
+        Jitcc.jmp(InvokePGFunc);
+
+        Jitcc.bind(StrictFail);
+        /* Op->resnull = true */
+        Jitcc.mov(ResnullPtr, jit::imm(1));
+        Jitcc.jmp(Opblocks[OpIndex + 1]);
       }
 
       /*
        * Before invoking PGFuncs, we should set FuncCallInfo->isnull to false.
        */
       Jitcc.bind(InvokePGFunc);
-      jit::x86::Mem FuncCallInfoIsNullPtr = jit::x86::ptr(
-          FuncCallInfoAddr, offsetof(FunctionCallInfoBaseData, isnull),
-          sizeof(bool));
+      x86::Mem FuncCallInfoIsNullPtr =
+          x86::ptr(FuncCallInfoAddr, offsetof(FunctionCallInfoBaseData, isnull),
+                   sizeof(bool));
       Jitcc.mov(FuncCallInfoIsNullPtr, jit::imm(0));
 
       jit::InvokeNode *PGFunc;
-      jit::x86::Gp RetValue = Jitcc.newUIntPtr();
+      x86::Gp RetValue = Jitcc.newUIntPtr();
       Jitcc.invoke(&PGFunc, jit::imm(FuncCallInfo->flinfo->fn_addr),
                    jit::FuncSignatureT<Datum, FunctionCallInfo>());
       PGFunc->setArg(0, FuncCallInfo);
@@ -433,26 +464,17 @@ static bool JitCompileExpr(ExprState *State) {
 
       /* Write result values. */
       Jitcc.mov(ResvaluePtr, RetValue);
-      jit::x86::Gp FuncCallInfoIsNull = Jitcc.newInt8();
+      x86::Gp FuncCallInfoIsNull = Jitcc.newInt8();
       Jitcc.mov(FuncCallInfoIsNull, FuncCallInfoIsNullPtr);
       Jitcc.mov(ResnullPtr, FuncCallInfoIsNull);
 
-      /* Jump to the next op block. */
-      Jitcc.jmp(Opblocks[OpIndex + 1]);
       break;
     }
 
     case EEOP_QUAL: {
       jit::Label HandleNullOrFalse = Jitcc.newLabel();
 
-      jit::x86::Gp ResvalueAddr = Jitcc.newUIntPtr(),
-                   ResnullAddr = Jitcc.newUIntPtr();
-      Jitcc.mov(ResvalueAddr, jit::imm(Op->resvalue));
-      Jitcc.mov(ResnullAddr, jit::imm(Op->resnull));
-      jit::x86::Mem ResvaluePtr = jit::x86::ptr(ResvalueAddr, 0, sizeof(Datum)),
-                    ResnullPtr = jit::x86::ptr(ResnullAddr, 0, sizeof(bool));
-
-      jit::x86::Gp Resvalue = Jitcc.newUIntPtr(), Resnull = Jitcc.newInt8();
+      x86::Gp Resvalue = Jitcc.newUIntPtr(), Resnull = Jitcc.newInt8();
       Jitcc.mov(Resvalue, ResvaluePtr);
       Jitcc.mov(Resnull, ResnullPtr);
 
@@ -471,8 +493,81 @@ static bool JitCompileExpr(ExprState *State) {
       Jitcc.mov(ResvaluePtr, jit::imm(0));
       Jitcc.mov(ResnullPtr, jit::imm(0));
 
-      /* Jump to the next op block. */
-      Jitcc.jmp(Opblocks[OpIndex + 1]);
+      break;
+    }
+
+    case EEOP_AGGREF: {
+      int AggNo = Op->d.aggref.aggno;
+
+      x86::Mem AggValues0AddrPtr =
+                   x86::ptr(econtextp, offsetof(ExprContext, ecxt_aggvalues),
+                            sizeof(Datum *)),
+               AggNulls0AddrPtr =
+                   x86::ptr(econtextp, offsetof(ExprContext, ecxt_aggnulls),
+                            sizeof(bool *));
+      x86::Gp AggValues0Addr = Jitcc.newUIntPtr(),
+              AggNulls0Addr = Jitcc.newUIntPtr();
+      Jitcc.mov(AggValues0Addr, AggValues0AddrPtr);
+      Jitcc.mov(AggNulls0Addr, AggNulls0AddrPtr);
+
+      x86::Mem AggValuePtr = x86::ptr(AggValues0Addr, AggNo * sizeof(Datum),
+                                      sizeof(Datum)),
+               AggNullPtr =
+                   x86::ptr(AggNulls0Addr, AggNo * sizeof(bool), sizeof(bool));
+      x86::Gp Value = Jitcc.newUIntPtr(), Null = Jitcc.newInt8();
+      Jitcc.mov(Value, AggValuePtr);
+      Jitcc.mov(Null, AggNullPtr);
+
+      /*
+       * *op->resvalue = econtext->ecxt_aggvalues[aggno];
+       * *op->resnull = econtext->ecxt_aggnulls[aggno];
+       */
+      Jitcc.mov(ResvaluePtr, Value);
+      Jitcc.mov(ResnullPtr, Null);
+
+      break;
+    }
+
+    case EEOP_AGG_STRICT_INPUT_CHECK_ARGS:
+    case EEOP_AGG_STRICT_INPUT_CHECK_NULLS: {
+      int NArgs = Op->d.agg_strict_input_check.nargs;
+      NullableDatum *Args = Op->d.agg_strict_input_check.args;
+      bool *Nulls = Op->d.agg_strict_input_check.nulls;
+      int Jumpnull = Op->d.agg_strict_input_check.jumpnull;
+
+      Assert(nargs > 0);
+
+      x86::Gp Args0Addr = Jitcc.newUIntPtr(), Nulls0Addr = Jitcc.newUIntPtr();
+      Jitcc.mov(Args0Addr, Args);
+      Jitcc.mov(Nulls0Addr, Nulls);
+
+      /* Strict function, check for NULL arguments. */
+      for (int ArgIndex = 0; ArgIndex < NArgs; ++ArgIndex) {
+        x86::Mem ArgIsNullPtr =
+            Opcode == EEOP_AGG_STRICT_INPUT_CHECK_ARGS
+                ? x86::ptr(Args0Addr,
+                           ArgIndex * sizeof(NullableDatum) +
+                               offsetof(NullableDatum, isnull),
+                           sizeof(bool))
+                : x86::ptr(Nulls0Addr, ArgIndex * sizeof(bool), sizeof(bool));
+        x86::Gp ArgIsNull = Jitcc.newInt8();
+        Jitcc.mov(ArgIsNull, ArgIsNullPtr);
+        Jitcc.cmp(ArgIsNull, jit::imm(1));
+        Jitcc.je(Opblocks[Jumpnull]);
+      }
+      break;
+    }
+
+    case EEOP_AGG_PLAIN_TRANS_STRICT_BYVAL: {
+      /*
+       * I'm lazy :p
+       */
+      jit::InvokeNode *InterpretAggPlainTransStrictByValFunc;
+      Jitcc.invoke(&InterpretAggPlainTransStrictByValFunc,
+                   InterpretAggPlainTransStrictByVal,
+                   jit::FuncSignatureT<void, ExprState *, ExprEvalStep *>());
+      InterpretAggPlainTransStrictByValFunc->setArg(0, expressionp);
+      InterpretAggPlainTransStrictByValFunc->setArg(1, jit::imm(Op));
       break;
     }
 
