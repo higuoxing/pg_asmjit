@@ -4,9 +4,6 @@ PROJ_ROOT_DIR := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 
 OBJS = asmjit.o
 
-# Disable the bitcode generation.
-override with_llvm = no
-
 # Build the libasmjit static library first.
 SHLIB_PREREQS += libasmjit
 PG_CPPFLAGS += -Ideps/asmjit/src
@@ -17,6 +14,9 @@ EXTRA_CLEAN = build
 
 # We should use C++ compiler to link object files.
 override COMPILER = $(CXX) $(CFLAGS)
+
+# Disable the bitcode generation.
+override with_llvm = no
 
 PG_CONFIG := pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
