@@ -241,6 +241,77 @@ static bool JitCompileExpr(ExprState *State) {
       Jitcc.endFunc();
       break;
     }
+    case EEOP_INNER_FETCHSOME:
+    case EEOP_OUTER_FETCHSOME:
+    case EEOP_SCAN_FETCHSOME: {
+      /* Step should not have been generated. */
+      Assert(TtsOps != &TTSOpsVirtual);
+
+      x86::Mem v_Slot =
+          Opcode == EEOP_INNER_FETCHSOME
+              ? v_EContextInnertuple
+              : (Opcode == EEOP_OUTER_FETCHSOME ? v_EContextOutertuple
+                                                : v_EContextScantuple);
+
+      /* Compute the address of Slot->tts_nvalid */
+      x86::Gp SlotAddr = Jitcc.newUIntPtr();
+      Jitcc.mov(SlotAddr, v_Slot);
+      x86::Mem v_TtsNvalid = x86::ptr(
+          SlotAddr, offsetof(TupleTableSlot, tts_nvalid), sizeof(AttrNumber));
+      x86::Gp TtsNvalid = Jitcc.newInt16();
+      Jitcc.mov(TtsNvalid, v_TtsNvalid);
+
+      /*
+       * Check if all required attributes are available, or whether deforming is
+       * required.
+       */
+      Jitcc.cmp(TtsNvalid, jit::imm(Op->d.fetch.last_var));
+      Jitcc.jge(Opblocks[OpIndex + 1]);
+
+      /*
+       * TODO: Add support for JITing the deforming process.
+       */
+      jit::InvokeNode *SlotGetSomeAttrsInt;
+      Jitcc.invoke(&SlotGetSomeAttrsInt, jit::imm(slot_getsomeattrs_int),
+                   jit::FuncSignatureT<void, TupleTableSlot *, int>());
+      SlotGetSomeAttrsInt->setArg(0, SlotAddr);
+      SlotGetSomeAttrsInt->setArg(1, jit::imm(Op->d.fetch.last_var));
+      break;
+    }
+
+    case EEOP_INNER_VAR:
+    case EEOP_OUTER_VAR:
+    case EEOP_SCAN_VAR: {
+      x86::Mem v_SlotValues =
+          Opcode == EEOP_INNER_VAR
+              ? v_InnertupleValues
+              : (Opcode == EEOP_OUTER_VAR ? v_OutertupleValues
+                                          : v_ScantupleValues);
+      x86::Mem v_SlotIsnulls =
+          Opcode == EEOP_INNER_VAR
+              ? v_InnertupleIsnulls
+              : (Opcode == EEOP_OUTER_VAR ? v_OutertupleIsnulls
+                                          : v_ScantupleIsnulls);
+      x86::Gp SlotValuesAddr = Jitcc.newUIntPtr(),
+              SlotIsnullsAddr = Jitcc.newUIntPtr();
+      Jitcc.mov(SlotValuesAddr, v_SlotValues);
+      Jitcc.mov(SlotIsnullsAddr, v_SlotIsnulls);
+
+      int Attrnum = Op->d.var.attnum;
+      x86::Mem v_SlotValue =
+          x86::ptr(SlotValuesAddr, Attrnum * sizeof(Datum), sizeof(Datum));
+      x86::Mem v_SlotIsnull =
+          x86::ptr(SlotIsnullsAddr, Attrnum * sizeof(bool), sizeof(bool));
+
+      x86::Gp SlotValue = Jitcc.newUIntPtr(), SlotIsnull = Jitcc.newInt8();
+      Jitcc.mov(SlotValue, v_SlotValue);
+      Jitcc.mov(SlotIsnull, v_SlotIsnull);
+
+      Jitcc.mov(v_Resvalue, SlotValue);
+      Jitcc.mov(v_Resnull, SlotIsnull);
+
+      break;
+    }
     case EEOP_ASSIGN_TMP: {
       size_t ResultNum = Op->d.assign_tmp.resultnum;
 
@@ -305,7 +376,97 @@ static bool JitCompileExpr(ExprState *State) {
 
       break;
     }
+    case EEOP_FUNCEXPR:
+    case EEOP_FUNCEXPR_STRICT: {
+      FunctionCallInfo FuncCallInfo = Op->d.func.fcinfo_data;
 
+      x86::Gp FuncCallInfoAddr = Jitcc.newUIntPtr();
+      Jitcc.mov(FuncCallInfoAddr, FuncCallInfo);
+
+      jit::Label InvokePGFunc = Jitcc.newLabel();
+
+      if (Opcode == EEOP_FUNCEXPR_STRICT) {
+        jit::Label StrictFail = Jitcc.newLabel();
+        /* Should make sure that they're optimized beforehand. */
+        int ArgsNum = Op->d.func.nargs;
+        if (ArgsNum == 0) {
+          ereport(ERROR,
+                  (errmsg("Argumentless strict functions are pointless")));
+        }
+
+        /* Check for NULL args for strict function. */
+        for (int ArgIndex = 0; ArgIndex < ArgsNum; ++ArgIndex) {
+          x86::Mem v_FuncCallInfoArgNIsNull =
+              x86::ptr(FuncCallInfoAddr,
+                       offsetof(FunctionCallInfoBaseData, args) +
+                           ArgIndex * sizeof(NullableDatum) +
+                           offsetof(NullableDatum, isnull),
+                       sizeof(bool));
+          x86::Gp FuncCallInfoArgNIsNull = Jitcc.newInt8();
+          Jitcc.mov(FuncCallInfoArgNIsNull, v_FuncCallInfoArgNIsNull);
+          Jitcc.cmp(FuncCallInfoArgNIsNull, jit::imm(1));
+          Jitcc.je(StrictFail);
+        }
+
+        Jitcc.jmp(InvokePGFunc);
+
+        Jitcc.bind(StrictFail);
+        /* Op->resnull = true */
+        Jitcc.mov(v_Resnull, jit::imm(1));
+        Jitcc.jmp(Opblocks[OpIndex + 1]);
+      }
+
+      /*
+       * Before invoking PGFuncs, we should set FuncCallInfo->isnull to false.
+       */
+      Jitcc.bind(InvokePGFunc);
+      x86::Mem v_FuncCallInfoIsNull =
+          x86::ptr(FuncCallInfoAddr, offsetof(FunctionCallInfoBaseData, isnull),
+                   sizeof(bool));
+      Jitcc.mov(v_FuncCallInfoIsNull, jit::imm(0));
+
+      jit::InvokeNode *PGFunc;
+      x86::Gp RetValue = Jitcc.newUIntPtr();
+      Jitcc.invoke(&PGFunc, jit::imm(FuncCallInfo->flinfo->fn_addr),
+                   jit::FuncSignatureT<Datum, FunctionCallInfo>());
+      PGFunc->setArg(0, FuncCallInfo);
+      PGFunc->setRet(0, RetValue);
+
+      /* Write result values. */
+      Jitcc.mov(v_Resvalue, RetValue);
+      x86::Gp FuncCallInfoIsNull = Jitcc.newInt8();
+      Jitcc.mov(FuncCallInfoIsNull, v_FuncCallInfoIsNull);
+      Jitcc.mov(v_Resnull, FuncCallInfoIsNull);
+
+      break;
+    }
+
+    case EEOP_QUAL: {
+      jit::Label HandleNullOrFalse = Jitcc.newLabel();
+
+      x86::Gp Resvalue = Jitcc.newUIntPtr(), Resnull = Jitcc.newInt8();
+      Jitcc.mov(Resvalue, v_Resvalue);
+      Jitcc.mov(Resnull, v_Resnull);
+
+      Jitcc.cmp(Resnull, jit::imm(1));
+      Jitcc.je(HandleNullOrFalse);
+
+      Jitcc.cmp(Resvalue, jit::imm(0));
+      Jitcc.je(HandleNullOrFalse);
+
+      Jitcc.jmp(Opblocks[OpIndex + 1]);
+
+      /* Handling null or false. */
+      Jitcc.bind(HandleNullOrFalse);
+
+      /* Set resnull and resvalue to false. */
+      Jitcc.mov(v_Resvalue, jit::imm(0));
+      Jitcc.mov(v_Resnull, jit::imm(0));
+
+      Jitcc.jmp(Opblocks[Op->d.qualexpr.jumpdone]);
+
+      break;
+    }
     case EEOP_LAST: {
       Assert(false);
       break;
