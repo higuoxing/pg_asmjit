@@ -1,10 +1,3 @@
-#if __cplusplus > 199711L
-/*
- * The register storage type is deprecated in C++11.
- */
-#define register
-#endif
-
 #include <asmjit/asmjit.h>
 
 namespace jit = asmjit;
@@ -12,6 +5,13 @@ namespace x86 = asmjit::x86;
 
 #ifdef __cplusplus
 extern "C" {
+#endif
+
+/*
+ * The register storage type is deprecated in C++11.
+ */
+#if __cplusplus > 199711L
+#define register
 #endif
 
 #include "postgres.h"
@@ -312,6 +312,28 @@ static bool JitCompileExpr(ExprState *State) {
 
       break;
     }
+    case EEOP_INNER_SYSVAR:
+    case EEOP_OUTER_SYSVAR:
+    case EEOP_SCAN_SYSVAR: {
+      x86::Mem v_Slot = Opcode == EEOP_INNER_VAR ? v_EContextInnertuple
+                                                 : (Opcode == EEOP_OUTER_SYSVAR
+                                                        ? v_EContextOutertuple
+                                                        : v_EContextScantuple);
+      x86::Gp SlotAddr = Jitcc.newUIntPtr();
+      Jitcc.mov(SlotAddr, v_Slot);
+
+      jit::InvokeNode *ExecEvalSysVarFunc;
+      Jitcc.invoke(&ExecEvalSysVarFunc, jit::imm(ExecEvalSysVar),
+                   jit::FuncSignatureT<void, ExprState *, ExprEvalStep *,
+                                       ExprContext *, TupleTableSlot *>());
+      ExecEvalSysVarFunc->setArg(0, ExpressionAddr);
+      ExecEvalSysVarFunc->setArg(1, jit::imm(Op));
+      ExecEvalSysVarFunc->setArg(2, EContextAddr);
+      ExecEvalSysVarFunc->setArg(3, SlotAddr);
+
+      break;
+    }
+
     case EEOP_ASSIGN_TMP: {
       size_t ResultNum = Op->d.assign_tmp.resultnum;
 
