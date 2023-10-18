@@ -24,6 +24,7 @@ extern "C" {
 #include "nodes/pg_list.h"
 #include "portability/instr_time.h"
 #include "storage/ipc.h"
+#include "utils/expandeddatum.h"
 #include "utils/memutils.h"
 #include "utils/palloc.h"
 #include "utils/resowner.h"
@@ -146,11 +147,15 @@ static bool JitCompileExpr(ExprState *State) {
    * Addresses for
    *   expression->resvalue,
    *   expression->resnull,
+   *   expression->resultslot,
    */
   x86::Mem v_StateResvalue = x86::ptr(
                ExpressionAddr, offsetof(ExprState, resvalue), sizeof(Datum)),
            v_StateResnull = x86::ptr(
-               ExpressionAddr, offsetof(ExprState, resnull), sizeof(bool));
+               ExpressionAddr, offsetof(ExprState, resnull), sizeof(bool)),
+           v_StateResultSlot =
+               x86::ptr(ExpressionAddr, offsetof(ExprState, resultslot),
+                        sizeof(TupleTableSlot *));
 
   /*
    * Addresses for
@@ -176,13 +181,17 @@ static bool JitCompileExpr(ExprState *State) {
    *   econtext->ext_innertuple->tts_isnull,
    *   econtext->ecxt_outertuple->tts_values,
    *   econtext->ext_outertuple->tts_isnull,
+   *   expression->resultslot->tts_values,
+   *   expression->resultslot->tts_isnull,
    */
   x86::Gp ScantupleAddr = Jitcc.newUIntPtr(),
           InnertupleAddr = Jitcc.newUIntPtr(),
-          OutertupleAddr = Jitcc.newUIntPtr();
+          OutertupleAddr = Jitcc.newUIntPtr(),
+          ResulttupleAddr = Jitcc.newUIntPtr();
   Jitcc.mov(ScantupleAddr, v_EContextScantuple);
   Jitcc.mov(InnertupleAddr, v_EContextInnertuple);
   Jitcc.mov(OutertupleAddr, v_EContextOutertuple);
+  Jitcc.mov(ResulttupleAddr, v_StateResultSlot);
   x86::Mem v_ScantupleValues =
                x86::ptr(ScantupleAddr, offsetof(TupleTableSlot, tts_values),
                         sizeof(Datum *)),
@@ -200,6 +209,12 @@ static bool JitCompileExpr(ExprState *State) {
                         sizeof(Datum *)),
            v_OutertupleIsnulls =
                x86::ptr(OutertupleAddr, offsetof(TupleTableSlot, tts_isnull),
+                        sizeof(bool *)),
+           v_ResulttupleValues =
+               x86::ptr(ResulttupleAddr, offsetof(TupleTableSlot, tts_values),
+                        sizeof(Datum *)),
+           v_ResulttupleIsnulls =
+               x86::ptr(ResulttupleAddr, offsetof(TupleTableSlot, tts_isnull),
                         sizeof(bool *));
 
   x86::Mem v_StateParent = x86::ptr(ExpressionAddr, offsetof(ExprState, parent),
@@ -334,7 +349,64 @@ static bool JitCompileExpr(ExprState *State) {
       break;
     }
 
-    case EEOP_ASSIGN_TMP: {
+    case EEOP_WHOLEROW: {
+      jit::InvokeNode *ExecEvalWholeRowVarFunc;
+      Jitcc.invoke(&ExecEvalWholeRowVarFunc, jit::imm(ExecEvalWholeRowVar),
+                   jit::FuncSignatureT<void, ExprState *, ExprEvalStep *,
+                                       ExprContext *>());
+      ExecEvalWholeRowVarFunc->setArg(0, ExpressionAddr);
+      ExecEvalWholeRowVarFunc->setArg(1, jit::imm(Op));
+      ExecEvalWholeRowVarFunc->setArg(2, EContextAddr);
+
+      break;
+    }
+
+    case EEOP_ASSIGN_INNER_VAR:
+    case EEOP_ASSIGN_OUTER_VAR:
+    case EEOP_ASSIGN_SCAN_VAR: {
+      x86::Mem v_SlotValues =
+          Opcode == EEOP_ASSIGN_INNER_VAR
+              ? v_InnertupleValues
+              : (Opcode == EEOP_ASSIGN_OUTER_VAR ? v_OutertupleValues
+                                                 : v_ScantupleValues);
+      x86::Mem v_SlotIsnulls =
+          Opcode == EEOP_ASSIGN_INNER_VAR
+              ? v_InnertupleIsnulls
+              : (Opcode == EEOP_ASSIGN_OUTER_VAR ? v_OutertupleIsnulls
+                                                 : v_ScantupleIsnulls);
+
+      x86::Gp SlotValuesAddr = Jitcc.newUIntPtr(),
+              SlotIsnullsAddr = Jitcc.newUIntPtr();
+      Jitcc.mov(SlotValuesAddr, v_SlotValues);
+      Jitcc.mov(SlotIsnullsAddr, v_SlotIsnulls);
+
+      int Attrnum = Op->d.assign_var.attnum;
+      x86::Mem v_SlotValue =
+          x86::ptr(SlotValuesAddr, Attrnum * sizeof(Datum), sizeof(Datum));
+      x86::Mem v_SlotIsnull =
+          x86::ptr(SlotIsnullsAddr, Attrnum * sizeof(bool), sizeof(bool));
+
+      /* Load data. */
+      x86::Gp SlotValue = Jitcc.newUIntPtr(), SlotIsnull = Jitcc.newInt8();
+      Jitcc.mov(SlotValue, v_SlotValue);
+      Jitcc.mov(SlotIsnull, v_SlotIsnull);
+
+      /* Compute addresses of targets. */
+      int Resultnum = Op->d.assign_var.resultnum;
+      Jitcc.mov(SlotValuesAddr, v_ResulttupleValues);
+      Jitcc.mov(SlotIsnullsAddr, v_ResulttupleIsnulls);
+      x86::Mem v_ResultValue =
+          x86::ptr(SlotValuesAddr, Resultnum * sizeof(Datum), sizeof(Datum));
+      x86::Mem v_ResultNull =
+          x86::ptr(SlotIsnullsAddr, Resultnum * sizeof(bool), sizeof(bool));
+      Jitcc.mov(v_ResultValue, SlotValue);
+      Jitcc.mov(v_ResultNull, SlotIsnull);
+
+      break;
+    }
+
+    case EEOP_ASSIGN_TMP:
+    case EEOP_ASSIGN_TMP_MAKE_RO: {
       size_t ResultNum = Op->d.assign_tmp.resultnum;
 
       /* Load expression->resvalue and expression->resnull */
@@ -344,43 +416,38 @@ static bool JitCompileExpr(ExprState *State) {
       Jitcc.mov(TempStateResnull, v_StateResnull);
 
       /*
-       * Compute the addresses of expression->resultslot->tts_values and
-       * expression->resultslot->tts_isnull
-       */
-      x86::Mem v_StateResultslot =
-          x86::ptr(ExpressionAddr, offsetof(ExprState, resultslot),
-                   sizeof(TupleTableSlot *));
-      x86::Gp StateResultslotAddr = Jitcc.newUInt64();
-      Jitcc.mov(StateResultslotAddr, v_StateResultslot);
-      x86::Mem v_TtsValues = x86::ptr(StateResultslotAddr,
-                                      offsetof(TupleTableSlot, tts_values),
-                                      sizeof(Datum *)),
-               v_TtsIsnulls = x86::ptr(StateResultslotAddr,
-                                       offsetof(TupleTableSlot, tts_isnull),
-                                       sizeof(bool *));
-
-      /*
        * Compute the addresses of
        * expression->resultslot->tts_values[ResultNum] and
        * expression->resultslot->tts_isnull[ResultNum]
        */
-      x86::Gp TtsValueAddr = Jitcc.newUIntPtr(),
-              TtsIsnullAddr = Jitcc.newUIntPtr();
-      Jitcc.mov(TtsValueAddr, v_TtsValues);
-      Jitcc.mov(TtsIsnullAddr, v_TtsIsnulls);
-      x86::Mem v_TtsValue = x86::ptr(TtsValueAddr, sizeof(Datum) * ResultNum,
-                                     sizeof(Datum)),
-               v_TtsIsnull = x86::ptr(TtsIsnullAddr, sizeof(bool) * ResultNum,
-                                      sizeof(bool));
+      x86::Gp ResultValueAddr = Jitcc.newUIntPtr(),
+              ResultIsnullAddr = Jitcc.newUIntPtr();
+      Jitcc.mov(ResultValueAddr, v_ResulttupleValues);
+      Jitcc.mov(ResultIsnullAddr, v_ResulttupleIsnulls);
+      x86::Mem v_ResultValue = x86::ptr(
+                   ResultValueAddr, sizeof(Datum) * ResultNum, sizeof(Datum)),
+               v_ResultIsnull = x86::ptr(
+                   ResultIsnullAddr, sizeof(bool) * ResultNum, sizeof(bool));
 
       /*
-       * Store expression->resvalue and expression->resnull to
-       * expression->resultslot->tts_values[ResultNum] and
-       * expression->resultslot->tts_isnull[ResultNum]
+       * Store nullness.
        */
-      Jitcc.mov(v_TtsValue, TempStateResvalue);
-      Jitcc.mov(v_TtsIsnull, TempStateResnull);
+      Jitcc.mov(v_ResultIsnull, TempStateResnull);
 
+      if (Opcode == EEOP_ASSIGN_TMP_MAKE_RO) {
+        Jitcc.cmp(TempStateResnull, jit::imm(1));
+        Jitcc.je(Opblocks[OpIndex + 1]);
+
+        jit::InvokeNode *MakeExpandedObjectReadOnlyInternalFunc;
+        Jitcc.invoke(&MakeExpandedObjectReadOnlyInternalFunc,
+                     jit::imm(MakeExpandedObjectReadOnlyInternal),
+                     jit::FuncSignatureT<Datum, Datum>());
+        MakeExpandedObjectReadOnlyInternalFunc->setArg(0, TempStateResvalue);
+        MakeExpandedObjectReadOnlyInternalFunc->setRet(0, TempStateResvalue);
+      }
+
+      /* Finally, store the result. */
+      Jitcc.mov(v_ResultValue, TempStateResvalue);
       break;
     }
     case EEOP_CONST: {
@@ -459,6 +526,32 @@ static bool JitCompileExpr(ExprState *State) {
       x86::Gp FuncCallInfoIsNull = Jitcc.newInt8();
       Jitcc.mov(FuncCallInfoIsNull, v_FuncCallInfoIsNull);
       Jitcc.mov(v_Resnull, FuncCallInfoIsNull);
+
+      break;
+    }
+
+    case EEOP_FUNCEXPR_FUSAGE: {
+      jit::InvokeNode *ExecEvalFuncExprFusageFunc;
+      Jitcc.invoke(&ExecEvalFuncExprFusageFunc,
+                   jit::imm(ExecEvalFuncExprFusage),
+                   jit::FuncSignatureT<void, ExprState *, ExprEvalStep *,
+                                       ExprContext *>());
+      ExecEvalFuncExprFusageFunc->setArg(0, ExpressionAddr);
+      ExecEvalFuncExprFusageFunc->setArg(1, jit::imm(Op));
+      ExecEvalFuncExprFusageFunc->setArg(2, EContextAddr);
+
+      break;
+    }
+
+    case EEOP_FUNCEXPR_STRICT_FUSAGE: {
+      jit::InvokeNode *ExecEvalFuncExprStrictFusageFunc;
+      Jitcc.invoke(&ExecEvalFuncExprStrictFusageFunc,
+                   jit::imm(ExecEvalFuncExprStrictFusage),
+                   jit::FuncSignatureT<void, ExprState *, ExprEvalStep *,
+                                       ExprContext *>());
+      ExecEvalFuncExprStrictFusageFunc->setArg(0, ExpressionAddr);
+      ExecEvalFuncExprStrictFusageFunc->setArg(1, jit::imm(Op));
+      ExecEvalFuncExprStrictFusageFunc->setArg(2, EContextAddr);
 
       break;
     }
