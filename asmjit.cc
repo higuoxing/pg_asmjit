@@ -102,6 +102,26 @@ static Datum ExecCompiledExpr(ExprState *State, ExprContext *EContext,
   return Func(State, EContext, IsNull);
 }
 
+#define BuildEvalXFunc2(Func)                                                  \
+  do {                                                                         \
+    jit::InvokeNode *JitFunc;                                                  \
+    Jitcc.invoke(&JitFunc, jit::imm(Func),                                     \
+                 jit::FuncSignatureT<void, ExprState *, ExprEvalStep *>());    \
+    JitFunc->setArg(0, ExpressionAddr);                                        \
+    JitFunc->setArg(1, jit::imm(Op));                                          \
+  } while (0);
+
+#define BuildEvalXFunc3(Func)                                                  \
+  do {                                                                         \
+    jit::InvokeNode *JitFunc;                                                  \
+    Jitcc.invoke(&JitFunc, jit::imm(Func),                                     \
+                 jit::FuncSignatureT<void, ExprState *, ExprEvalStep *,        \
+                                     ExprContext *>());                        \
+    JitFunc->setArg(0, ExpressionAddr);                                        \
+    JitFunc->setArg(1, jit::imm(Op));                                          \
+    JitFunc->setArg(2, EContextAddr);                                          \
+  } while (0);
+
 static bool JitCompileExpr(ExprState *State) {
   PlanState *Parent = State->parent;
   AsmJitContext *Context = nullptr;
@@ -350,13 +370,7 @@ static bool JitCompileExpr(ExprState *State) {
     }
 
     case EEOP_WHOLEROW: {
-      jit::InvokeNode *ExecEvalWholeRowVarFunc;
-      Jitcc.invoke(&ExecEvalWholeRowVarFunc, jit::imm(ExecEvalWholeRowVar),
-                   jit::FuncSignatureT<void, ExprState *, ExprEvalStep *,
-                                       ExprContext *>());
-      ExecEvalWholeRowVarFunc->setArg(0, ExpressionAddr);
-      ExecEvalWholeRowVarFunc->setArg(1, jit::imm(Op));
-      ExecEvalWholeRowVarFunc->setArg(2, EContextAddr);
+      BuildEvalXFunc3(ExecEvalWholeRowVar);
 
       break;
     }
@@ -531,28 +545,12 @@ static bool JitCompileExpr(ExprState *State) {
     }
 
     case EEOP_FUNCEXPR_FUSAGE: {
-      jit::InvokeNode *ExecEvalFuncExprFusageFunc;
-      Jitcc.invoke(&ExecEvalFuncExprFusageFunc,
-                   jit::imm(ExecEvalFuncExprFusage),
-                   jit::FuncSignatureT<void, ExprState *, ExprEvalStep *,
-                                       ExprContext *>());
-      ExecEvalFuncExprFusageFunc->setArg(0, ExpressionAddr);
-      ExecEvalFuncExprFusageFunc->setArg(1, jit::imm(Op));
-      ExecEvalFuncExprFusageFunc->setArg(2, EContextAddr);
-
+      BuildEvalXFunc3(ExecEvalFuncExprFusage);
       break;
     }
 
     case EEOP_FUNCEXPR_STRICT_FUSAGE: {
-      jit::InvokeNode *ExecEvalFuncExprStrictFusageFunc;
-      Jitcc.invoke(&ExecEvalFuncExprStrictFusageFunc,
-                   jit::imm(ExecEvalFuncExprStrictFusage),
-                   jit::FuncSignatureT<void, ExprState *, ExprEvalStep *,
-                                       ExprContext *>());
-      ExecEvalFuncExprStrictFusageFunc->setArg(0, ExpressionAddr);
-      ExecEvalFuncExprStrictFusageFunc->setArg(1, jit::imm(Op));
-      ExecEvalFuncExprStrictFusageFunc->setArg(2, EContextAddr);
-
+      BuildEvalXFunc3(ExecEvalFuncExprStrictFusage);
       break;
     }
 
@@ -582,6 +580,122 @@ static bool JitCompileExpr(ExprState *State) {
 
       break;
     }
+
+    case EEOP_SQLVALUEFUNCTION: {
+      BuildEvalXFunc2(ExecEvalSQLValueFunction);
+      break;
+    }
+
+    case EEOP_CURRENTOFEXPR: {
+      BuildEvalXFunc2(ExecEvalCurrentOfExpr);
+      break;
+    }
+
+    case EEOP_NEXTVALUEEXPR: {
+      BuildEvalXFunc2(ExecEvalNextValueExpr);
+      break;
+    }
+
+    case EEOP_ARRAYEXPR: {
+      BuildEvalXFunc2(ExecEvalArrayExpr);
+      break;
+    }
+
+    case EEOP_ARRAYCOERCE: {
+      BuildEvalXFunc3(ExecEvalArrayCoerce);
+      break;
+    }
+
+    case EEOP_ROW: {
+      BuildEvalXFunc2(ExecEvalRow);
+      break;
+    }
+
+    case EEOP_MINMAX: {
+      BuildEvalXFunc2(ExecEvalMinMax);
+      break;
+    }
+
+    case EEOP_FIELDSELECT: {
+      BuildEvalXFunc3(ExecEvalFieldSelect);
+      break;
+    }
+
+    case EEOP_FIELDSTORE_DEFORM: {
+      BuildEvalXFunc3(ExecEvalFieldStoreDeForm);
+      break;
+    }
+
+    case EEOP_FIELDSTORE_FORM: {
+      BuildEvalXFunc3(ExecEvalFieldStoreForm);
+      break;
+    }
+
+    case EEOP_DOMAIN_NOTNULL: {
+      BuildEvalXFunc2(ExecEvalConstraintNotNull);
+      break;
+    }
+
+    case EEOP_DOMAIN_CHECK: {
+      BuildEvalXFunc2(ExecEvalConstraintCheck);
+      break;
+    }
+
+    case EEOP_CONVERT_ROWTYPE: {
+      BuildEvalXFunc3(ExecEvalConvertRowtype);
+      break;
+    }
+
+    case EEOP_SCALARARRAYOP: {
+      BuildEvalXFunc2(ExecEvalScalarArrayOp);
+      break;
+    }
+
+    case EEOP_HASHED_SCALARARRAYOP: {
+      BuildEvalXFunc3(ExecEvalHashedScalarArrayOp);
+      break;
+    }
+
+    case EEOP_XMLEXPR: {
+      BuildEvalXFunc2(ExecEvalXmlExpr);
+      break;
+    }
+
+    case EEOP_GROUPING_FUNC: {
+      BuildEvalXFunc2(ExecEvalGroupingFunc);
+      break;
+    }
+
+    case EEOP_SUBPLAN: {
+      BuildEvalXFunc3(ExecEvalSubPlan);
+      break;
+    }
+
+    case EEOP_AGG_ORDERED_TRANS_DATUM: {
+      BuildEvalXFunc3(ExecEvalAggOrderedTransDatum);
+      break;
+    }
+
+    case EEOP_AGG_ORDERED_TRANS_TUPLE: {
+      BuildEvalXFunc3(ExecEvalAggOrderedTransTuple);
+      break;
+    }
+
+    case EEOP_JSON_CONSTRUCTOR: {
+      BuildEvalXFunc3(ExecEvalJsonConstructor);
+      break;
+    }
+
+    case EEOP_IS_JSON: {
+      BuildEvalXFunc2(ExecEvalJsonIsPredicate);
+      break;
+    }
+
+    case EEOP_JSONEXPR: {
+      BuildEvalXFunc3(ExecEvalJson);
+      break;
+    }
+
     case EEOP_LAST: {
       Assert(false);
       break;
