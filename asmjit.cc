@@ -681,21 +681,6 @@ static bool JitCompileExpr(ExprState *State) {
       break;
     }
 
-    case EEOP_JSON_CONSTRUCTOR: {
-      BuildEvalXFunc3(ExecEvalJsonConstructor);
-      break;
-    }
-
-    case EEOP_IS_JSON: {
-      BuildEvalXFunc2(ExecEvalJsonIsPredicate);
-      break;
-    }
-
-    case EEOP_JSONEXPR: {
-      BuildEvalXFunc3(ExecEvalJson);
-      break;
-    }
-
     case EEOP_LAST: {
       Assert(false);
       break;
