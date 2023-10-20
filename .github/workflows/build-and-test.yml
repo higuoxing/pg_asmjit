@@ -34,7 +34,7 @@ jobs:
           sudo --preserve-env=PG_CONFIG make install
       - run: |
           cd postgres
-          ./configure --prefix=/usr/lib/postgresql/${{ matrix.postgres }}
+          sudo -u postgres ./configure --prefix=/usr/lib/postgresql/${{ matrix.postgres }}
           sudo -u postgres make installcheck
       - if: ${{ failure() }}
         run: cat postgres/src/test/regress/regression.diffs
