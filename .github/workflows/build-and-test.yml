@@ -38,4 +38,5 @@ jobs:
           ./configure --prefix=/usr/lib/postgresql/${{ matrix.postgres }}
           make installcheck
       - if: ${{ failure() }}
-        run: cat postgres/src/test/regress/regression.diffs
+        uses: mxschmitt/action-tmate@v3
+        ## run: cat postgres/src/test/regress/regression.diffs
