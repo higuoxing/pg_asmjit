@@ -22,10 +22,16 @@ jobs:
         with:
           postgres-version: ${{ matrix.postgres }}
           dev-files: true
+      - uses: actions/checkout@v4
+        with:
+          repository: https://github.com/postgres/postgres.git
+          ref: REL_${{ matrix.postgres }}_STABLE
+          submodules: true
       - run: make
         env:
           PG_CFLAGS: -Wall -Wextra -Werror -Wno-unused-parameter -Wno-sign-compare
       - run: |
+          ls -al
           export PG_CONFIG=`which pg_config`
           sudo --preserve-env=PG_CONFIG make install
       - run: make installcheck
