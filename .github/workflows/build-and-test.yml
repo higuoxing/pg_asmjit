@@ -8,8 +8,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - postgres: 17
-            os: ubuntu-22.04
           - postgres: 16
             os: ubuntu-22.04
           - postgres: 15
@@ -24,7 +22,7 @@ jobs:
           dev-files: true
       - uses: actions/checkout@v4
         with:
-          repository: https://github.com/postgres/postgres.git
+          repository: postgres/postgres
           ref: REL_${{ matrix.postgres }}_STABLE
           submodules: true
       - run: make
