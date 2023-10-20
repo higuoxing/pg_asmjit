@@ -20,15 +20,21 @@ jobs:
         with:
           postgres-version: ${{ matrix.postgres }}
           dev-files: true
+          config: |
+            jit_above_cost=0
+            jit=on
+            jit_provider='asmjit'
       - run: |
           git clone https://github.com/postgres/postgres -b REL_${{ matrix.postgres }}_STABLE
       - run: make
         env:
           PG_CFLAGS: -Wall -Wextra -Werror -Wno-unused-parameter -Wno-sign-compare
       - run: |
-          ls -al
           export PG_CONFIG=`which pg_config`
           sudo --preserve-env=PG_CONFIG make install
-      - run: make installcheck
+      - run:
+          cd postgres
+          ./configure
+          make installcheck
       - if: ${{ failure() }}
         run: cat regression.diffs
