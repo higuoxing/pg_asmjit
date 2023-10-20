@@ -13,9 +13,6 @@ jobs:
           - postgres: 15
             os: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: true
       - uses: ankane/setup-postgres@v1
         with:
           postgres-version: ${{ matrix.postgres }}
@@ -24,6 +21,9 @@ jobs:
             jit_above_cost=0
             jit=on
             jit_provider='asmjit'
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
       - run: |
           git clone https://github.com/postgres/postgres -b REL_${{ matrix.postgres }}_STABLE
       - run: make
