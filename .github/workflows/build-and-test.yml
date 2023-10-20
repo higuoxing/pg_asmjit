@@ -35,6 +35,6 @@ jobs:
       - run: |
           cd postgres
           ./configure --prefix=/usr/lib/postgresql/${{ matrix.postgres }}
-          sudo make installcheck
+          sudo PGUSER="$USER" make installcheck
       - if: ${{ failure() }}
         run: cat postgres/src/test/regress/regression.diffs
