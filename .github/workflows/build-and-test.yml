@@ -34,7 +34,7 @@ jobs:
           sudo --preserve-env=PG_CONFIG make install
       - run: |
           sudo usermod -a -G docker postgres
-          sudo chmod 0777 -R postgres/src/test/regress
+          sudo chmod 0777 -R postgres/src/test/regress/
           sudo systemctl restart postgresql@${{ matrix.postgres }}-main
 
           cd postgres
