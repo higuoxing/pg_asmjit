@@ -35,6 +35,7 @@ jobs:
       - run: |
           cd postgres
           ./configure --prefix=/usr/lib/postgresql/${{ matrix.postgres }}
+          chmod 777 -R src/test/regress/
           make installcheck
       - if: ${{ failure() }}
         run: cat postgres/src/test/regress/regression.diffs
