@@ -33,6 +33,7 @@ jobs:
           export PG_CONFIG=`which pg_config`
           sudo --preserve-env=PG_CONFIG make install
       - run: |
+          sudo chown -R postgres:postgres postgres
           cd postgres
           ./configure --prefix=/usr/lib/postgresql/${{ matrix.postgres }}
           make installcheck
