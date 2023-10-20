@@ -31,7 +31,7 @@ jobs:
           PG_CFLAGS: -Wall -Wextra -Werror -Wno-unused-parameter -Wno-sign-compare
       - run: |
           export PG_CONFIG=`which pg_config`
-          sudo -u postgres --preserve-env=PG_CONFIG make install
+          sudo --preserve-env=PG_CONFIG make install
       - run: |
           cd postgres
           sudo -u postgres ./configure --prefix=/usr/lib/postgresql/${{ matrix.postgres }}
