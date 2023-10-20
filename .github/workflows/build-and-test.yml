@@ -35,7 +35,7 @@ jobs:
       - run: |
           sudo chown -R postgres:postgres postgres
           cd postgres
-          sudo -u postgres ./configure --prefix=/usr/lib/postgresql/${{ matrix.postgres }}
+          sudo -u postgres "$(pwd)"/configure --prefix=/usr/lib/postgresql/${{ matrix.postgres }}
           sudo -u postgres make installcheck
       - if: ${{ failure() }}
         run: cat postgres/src/test/regress/regression.diffs
