@@ -34,7 +34,7 @@ jobs:
           sudo --preserve-env=PG_CONFIG make install
       - run: |
           cd postgres
-          ./configure
+          ./configure --prefix=/usr/lib/postgresql/16
           make installcheck
       - if: ${{ failure() }}
         run: cat regression.diffs
