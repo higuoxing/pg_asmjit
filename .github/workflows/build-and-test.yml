@@ -34,6 +34,7 @@ jobs:
           sudo --preserve-env=PG_CONFIG make install
       - run: |
           sudo usermod -a -G docker postgres
+          mkdir -p postgres/src/test/regress/results
           sudo chmod 0777 -R postgres/src/test/regress/
           sudo systemctl restart postgresql@${{ matrix.postgres }}-main
 
@@ -43,4 +44,3 @@ jobs:
       - if: ${{ failure() }}
         uses: mxschmitt/action-tmate@v3
         ## run: cat postgres/src/test/regress/regression.diffs
-
