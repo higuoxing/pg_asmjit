@@ -2,7 +2,7 @@ MODULE_big = asmjit
 EXTENSION = asmjit
 PROJ_ROOT_DIR := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 
-OBJS = asmjit.o
+OBJS = asmjit.o asmjit_deform.o asmjit_expr.o
 
 # Build the libasmjit static library first.
 SHLIB_PREREQS += libasmjit
