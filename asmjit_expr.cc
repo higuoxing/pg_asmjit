@@ -1,7 +1,9 @@
 #include "asmjit_common.h"
+#include "executor/tuptable.h"
+#include "jit/jit.h"
 
 namespace jit = asmjit;
-namespace x86 = asmjit::x86;
+namespace x86 = jit::x86;
 
 extern "C" {
 
@@ -252,6 +254,7 @@ bool AsmJitCompileExpr(ExprState *State) {
     case EEOP_INNER_FETCHSOME:
     case EEOP_OUTER_FETCHSOME:
     case EEOP_SCAN_FETCHSOME: {
+
       /* Step should not have been generated. */
       Assert(TtsOps != &TTSOpsVirtual);
 
@@ -277,10 +280,29 @@ bool AsmJitCompileExpr(ExprState *State) {
       Jitcc.jge(Opblocks[OpIndex + 1]);
 
       /*
-       * TODO: Add support for JITing the deforming process.
+       * If the tupledesc of the to-be-deformed tuple is known,
+       * and JITing of deforming is enabled, build deform
+       * function specific to tupledesc and the exact number of
+       * to-be-extracted attributes.
        */
+      void (*SlotGetSomeAttrsIntFunc)(TupleTableSlot *, int) =
+          slot_getsomeattrs_int;
+      const TupleTableSlotOps *TtsOps =
+          Op->d.fetch.fixed ? Op->d.fetch.kind : nullptr;
+      TupleDesc Desc =
+          Op->d.fetch.known_desc ? Op->d.fetch.known_desc : nullptr;
+
+      if (TtsOps != nullptr && Desc != nullptr &&
+          (Context->base.flags & PGJIT_DEFORM)) {
+        void (*SlotGetSomeAttrsIntFuncJitted)(TupleTableSlot *, int) =
+            CompileTupleDeformFunc((JitContext *)Context, Runtime, Desc, TtsOps,
+                                   Op->d.fetch.last_var);
+        if (SlotGetSomeAttrsIntFuncJitted != nullptr)
+          SlotGetSomeAttrsIntFunc = SlotGetSomeAttrsIntFuncJitted;
+      }
+
       jit::InvokeNode *SlotGetSomeAttrsInt;
-      Jitcc.invoke(&SlotGetSomeAttrsInt, jit::imm(slot_getsomeattrs_int),
+      Jitcc.invoke(&SlotGetSomeAttrsInt, jit::imm(SlotGetSomeAttrsIntFunc),
                    jit::FuncSignatureT<void, TupleTableSlot *, int>());
       SlotGetSomeAttrsInt->setArg(0, SlotAddr);
       SlotGetSomeAttrsInt->setArg(1, jit::imm(Op->d.fetch.last_var));
@@ -669,10 +691,10 @@ bool AsmJitCompileExpr(ExprState *State) {
   instr_time CodeEmissionStartTime, CodeEmissionEndTime;
   ExprStateEvalFunc EvalFunc;
   INSTR_TIME_SET_CURRENT(CodeEmissionStartTime);
-  jit::Error err = Runtime.add(&EvalFunc, &Code);
-  if (err) {
+  jit::Error Err = Runtime.add(&EvalFunc, &Code);
+  if (Err) {
     ereport(LOG,
-            (errmsg("Jit failed: %s", jit::DebugUtils::errorAsString(err))));
+            (errmsg("Jit failed: %s", jit::DebugUtils::errorAsString(Err))));
     return false;
   }
   INSTR_TIME_SET_CURRENT(CodeEmissionEndTime);

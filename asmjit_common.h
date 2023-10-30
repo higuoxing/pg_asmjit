@@ -1,7 +1,10 @@
 #ifndef _PG_ASMJIT_H_
 #define _PG_ASMJIT_H_
 
+#include "asmjit/core/jitruntime.h"
 #include <asmjit/asmjit.h>
+
+namespace jit = asmjit;
 
 extern "C" {
 #if __cplusplus > 199711L
@@ -27,6 +30,16 @@ extern "C" {
 extern bool AsmJitCompileExpr(ExprState *State);
 extern void AsmJitReleaseContext(JitContext *Ctx);
 extern void AsmJitResetAfterError(void);
+
+/*
+ * For jitting the tuple deforming process.
+ */
+typedef void (*TupleDeformFunc)(TupleTableSlot *, int);
+extern TupleDeformFunc CompileTupleDeformFunc(JitContext *Ctx,
+                                              jit::JitRuntime &Runtime,
+                                              TupleDesc Desc,
+                                              const TupleTableSlotOps *Ops,
+                                              int Nattrs);
 }
 
 #endif
