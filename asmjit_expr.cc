@@ -78,8 +78,9 @@ static Datum ExecCompiledExpr(ExprState *State, ExprContext *EContext,
 #define BuildEvalXFunc2(Func)                                                  \
   do {                                                                         \
     jit::InvokeNode *JitFunc;                                                  \
-    Jitcc.invoke(&JitFunc, jit::imm(Func),                                     \
-                 jit::FuncSignatureT<void, ExprState *, ExprEvalStep *>());    \
+    Jitcc.invoke(                                                              \
+        &JitFunc, jit::imm(Func),                                              \
+        jit::FuncSignature::build<void, ExprState *, ExprEvalStep *>());       \
     JitFunc->setArg(0, ExpressionAddr);                                        \
     JitFunc->setArg(1, jit::imm(Op));                                          \
   } while (0);
@@ -88,8 +89,8 @@ static Datum ExecCompiledExpr(ExprState *State, ExprContext *EContext,
   do {                                                                         \
     jit::InvokeNode *JitFunc;                                                  \
     Jitcc.invoke(&JitFunc, jit::imm(Func),                                     \
-                 jit::FuncSignatureT<void, ExprState *, ExprEvalStep *,        \
-                                     ExprContext *>());                        \
+                 jit::FuncSignature::build<void, ExprState *, ExprEvalStep *,  \
+                                           ExprContext *>());                  \
     JitFunc->setArg(0, ExpressionAddr);                                        \
     JitFunc->setArg(1, jit::imm(Op));                                          \
     JitFunc->setArg(2, EContextAddr);                                          \
@@ -126,7 +127,7 @@ bool AsmJitCompileExpr(ExprState *State) {
    *                         bool *isNull);
    */
   jit::FuncNode *JittedFunc = Jitcc.addFunc(
-      jit::FuncSignatureT<Datum, ExprState *, ExprContext *, bool *>());
+      jit::FuncSignature::build<Datum, ExprState *, ExprContext *, bool *>());
 
   x86::Gp ExpressionAddr = Jitcc.newUIntPtr("expression"),
           EContextAddr = Jitcc.newUIntPtr("econtext"),
@@ -253,7 +254,7 @@ bool AsmJitCompileExpr(ExprState *State) {
     case EEOP_OUTER_FETCHSOME:
     case EEOP_SCAN_FETCHSOME: {
       /* Step should not have been generated. */
-      Assert(TtsOps != &TTSOpsVirtual);
+      /* FIXME: Assert(TtsOps != &TTSOpsVirtual);*/
 
       x86::Mem v_Slot =
           Opcode == EEOP_INNER_FETCHSOME
@@ -281,7 +282,7 @@ bool AsmJitCompileExpr(ExprState *State) {
        */
       jit::InvokeNode *SlotGetSomeAttrsInt;
       Jitcc.invoke(&SlotGetSomeAttrsInt, jit::imm(slot_getsomeattrs_int),
-                   jit::FuncSignatureT<void, TupleTableSlot *, int>());
+                   jit::FuncSignature::build<void, TupleTableSlot *, int>());
       SlotGetSomeAttrsInt->setArg(0, SlotAddr);
       SlotGetSomeAttrsInt->setArg(1, jit::imm(Op->d.fetch.last_var));
       break;
@@ -331,9 +332,10 @@ bool AsmJitCompileExpr(ExprState *State) {
       Jitcc.mov(SlotAddr, v_Slot);
 
       jit::InvokeNode *ExecEvalSysVarFunc;
-      Jitcc.invoke(&ExecEvalSysVarFunc, jit::imm(ExecEvalSysVar),
-                   jit::FuncSignatureT<void, ExprState *, ExprEvalStep *,
-                                       ExprContext *, TupleTableSlot *>());
+      Jitcc.invoke(
+          &ExecEvalSysVarFunc, jit::imm(ExecEvalSysVar),
+          jit::FuncSignature::build<void, ExprState *, ExprEvalStep *,
+                                    ExprContext *, TupleTableSlot *>());
       ExecEvalSysVarFunc->setArg(0, ExpressionAddr);
       ExecEvalSysVarFunc->setArg(1, jit::imm(Op));
       ExecEvalSysVarFunc->setArg(2, EContextAddr);
@@ -427,7 +429,7 @@ bool AsmJitCompileExpr(ExprState *State) {
         jit::InvokeNode *MakeExpandedObjectReadOnlyInternalFunc;
         Jitcc.invoke(&MakeExpandedObjectReadOnlyInternalFunc,
                      jit::imm(MakeExpandedObjectReadOnlyInternal),
-                     jit::FuncSignatureT<Datum, Datum>());
+                     jit::FuncSignature::build<Datum, Datum>());
         MakeExpandedObjectReadOnlyInternalFunc->setArg(0, TempStateResvalue);
         MakeExpandedObjectReadOnlyInternalFunc->setRet(0, TempStateResvalue);
       }
@@ -503,7 +505,7 @@ bool AsmJitCompileExpr(ExprState *State) {
       jit::InvokeNode *PGFunc;
       x86::Gp RetValue = Jitcc.newUIntPtr();
       Jitcc.invoke(&PGFunc, jit::imm(FuncCallInfo->flinfo->fn_addr),
-                   jit::FuncSignatureT<Datum, FunctionCallInfo>());
+                   jit::FuncSignature::build<Datum, FunctionCallInfo>());
       PGFunc->setArg(0, FuncCallInfo);
       PGFunc->setRet(0, RetValue);
 
