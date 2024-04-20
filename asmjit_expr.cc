@@ -8,10 +8,35 @@ extern "C" {
 static bool JitSessionInitialized = false;
 static jit::JitRuntime Runtime;
 
+static void ResOwnerReleaseJitContext(Datum res) {
+  JitContext *context = (JitContext *)DatumGetPointer(res);
+
+  context->resowner = NULL;
+  jit_release_context(context);
+}
+
+static const ResourceOwnerDesc jit_resowner_desc = {
+    .name = "LLVM JIT context",
+    .release_phase = RESOURCE_RELEASE_BEFORE_LOCKS,
+    .release_priority = RELEASE_PRIO_JIT_CONTEXTS,
+    .ReleaseResource = ResOwnerReleaseJitContext,
+    .DebugPrint = NULL /* the default message is fine */
+};
+
 typedef struct AsmJitContext {
   JitContext base;
   List *funcs;
 } AsmJitContext;
+
+/* Convenience wrappers over ResourceOwnerRemember/Forget */
+static inline void ResourceOwnerRememberJIT(ResourceOwner owner,
+                                            AsmJitContext *handle) {
+  ResourceOwnerRemember(owner, PointerGetDatum(handle), &jit_resowner_desc);
+}
+static inline void ResourceOwnerForgetJIT(ResourceOwner owner,
+                                          AsmJitContext *handle) {
+  ResourceOwnerForget(owner, PointerGetDatum(handle), &jit_resowner_desc);
+}
 
 void AsmJitReleaseContext(JitContext *Ctx) {
   AsmJitContext *Context = (AsmJitContext *)Ctx;
@@ -33,6 +58,9 @@ void AsmJitReleaseContext(JitContext *Ctx) {
 
   list_free(Context->funcs);
   Context->funcs = NIL;
+
+  if (Ctx->resowner)
+    ResourceOwnerForgetJIT(Ctx->resowner, Context);
 }
 
 void AsmJitResetAfterError(void) { /* TODO */
@@ -48,7 +76,7 @@ static void JitInitializeSession(void) {
 static AsmJitContext *JitCreateContext(int JitFlags) {
   JitInitializeSession();
 
-  ResourceOwnerEnlargeJIT(CurrentResourceOwner);
+  ResourceOwnerEnlarge(CurrentResourceOwner);
 
   AsmJitContext *Context = (AsmJitContext *)MemoryContextAllocZero(
       TopMemoryContext, sizeof(AsmJitContext));
@@ -57,7 +85,7 @@ static AsmJitContext *JitCreateContext(int JitFlags) {
 
   /* ensure cleanup */
   Context->base.resowner = CurrentResourceOwner;
-  ResourceOwnerRememberJIT(CurrentResourceOwner, PointerGetDatum(Context));
+  ResourceOwnerRememberJIT(CurrentResourceOwner, Context);
 
   return Context;
 }

@@ -1,3 +1,4 @@
 [submodule "deps/asmjit"]
 	path = deps/asmjit
 	url = https://github.com/asmjit/asmjit.git
+	ignore = dirty

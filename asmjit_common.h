@@ -22,7 +22,6 @@ extern "C" {
 #include "utils/memutils.h"
 #include "utils/palloc.h"
 #include "utils/resowner.h"
-#include "utils/resowner_private.h"
 
 extern bool AsmJitCompileExpr(ExprState *State);
 extern void AsmJitReleaseContext(JitContext *Ctx);
