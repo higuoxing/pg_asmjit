@@ -16,17 +16,12 @@ static void ResOwnerReleaseJitContext(Datum res) {
 }
 
 static const ResourceOwnerDesc jit_resowner_desc = {
-    .name = "LLVM JIT context",
+    .name = "AsmJit context",
     .release_phase = RESOURCE_RELEASE_BEFORE_LOCKS,
     .release_priority = RELEASE_PRIO_JIT_CONTEXTS,
     .ReleaseResource = ResOwnerReleaseJitContext,
     .DebugPrint = NULL /* the default message is fine */
 };
-
-typedef struct AsmJitContext {
-  JitContext base;
-  List *funcs;
-} AsmJitContext;
 
 /* Convenience wrappers over ResourceOwnerRemember/Forget */
 static inline void ResourceOwnerRememberJIT(ResourceOwner owner,
@@ -59,8 +54,8 @@ void AsmJitReleaseContext(JitContext *Ctx) {
   list_free(Context->funcs);
   Context->funcs = NIL;
 
-  if (Ctx->resowner)
-    ResourceOwnerForgetJIT(Ctx->resowner, Context);
+  if (Context->base.resowner)
+    ResourceOwnerForgetJIT(Context->base.resowner, Context);
 }
 
 void AsmJitResetAfterError(void) { /* TODO */
@@ -127,7 +122,7 @@ static Datum ExecCompiledExpr(ExprState *State, ExprContext *EContext,
 bool AsmJitCompileExpr(ExprState *State) {
   PlanState *Parent = State->parent;
   AsmJitContext *Context = nullptr;
-  instr_time CodeGenStartTime, CodeGenEndTime;
+  instr_time CodeGenStartTime, CodeGenEndTime, DeformStartTime, DeformEndTime;
 
   /*
    * Right now we don't support compiling expressions without a parent, as
@@ -281,8 +276,13 @@ bool AsmJitCompileExpr(ExprState *State) {
     case EEOP_INNER_FETCHSOME:
     case EEOP_OUTER_FETCHSOME:
     case EEOP_SCAN_FETCHSOME: {
+      const TupleTableSlotOps *TtsOps =
+          Op->d.fetch.fixed ? Op->d.fetch.kind : nullptr;
+      TupleDesc Desc = Op->d.fetch.known_desc;
+      TupleDeformingFunc CompiledTupleDeformingFunc = nullptr;
+
       /* Step should not have been generated. */
-      /* FIXME: Assert(TtsOps != &TTSOpsVirtual);*/
+      Assert(TtsOps != &TTSOpsVirtual);
 
       x86::Mem v_Slot =
           Opcode == EEOP_INNER_FETCHSOME
@@ -305,14 +305,29 @@ bool AsmJitCompileExpr(ExprState *State) {
       Jitcc.cmp(TtsNvalid, jit::imm(Op->d.fetch.last_var));
       Jitcc.jge(Opblocks[OpIndex + 1]);
 
-      /*
-       * TODO: Add support for JITing the deforming process.
-       */
-      jit::InvokeNode *SlotGetSomeAttrsInt;
-      Jitcc.invoke(&SlotGetSomeAttrsInt, jit::imm(slot_getsomeattrs_int),
-                   jit::FuncSignature::build<void, TupleTableSlot *, int>());
-      SlotGetSomeAttrsInt->setArg(0, SlotAddr);
-      SlotGetSomeAttrsInt->setArg(1, jit::imm(Op->d.fetch.last_var));
+      if (TtsOps && Desc && (Context->base.flags & PGJIT_DEFORM)) {
+        INSTR_TIME_SET_CURRENT(DeformStartTime);
+
+        CompiledTupleDeformingFunc = CompileTupleDeformingFunc(
+            Context, Runtime, Desc, TtsOps, Op->d.fetch.last_var);
+
+        INSTR_TIME_SET_CURRENT(DeformEndTime);
+        INSTR_TIME_ACCUM_DIFF(Context->base.instr.deform_counter, DeformEndTime,
+                              DeformStartTime);
+      }
+
+      jit::InvokeNode *SlotGetSomeAttrsInt = nullptr;
+      if (CompiledTupleDeformingFunc) {
+        Jitcc.invoke(&SlotGetSomeAttrsInt, jit::imm(CompiledTupleDeformingFunc),
+                     jit::FuncSignature::build<void, TupleTableSlot *>());
+        SlotGetSomeAttrsInt->setArg(0, SlotAddr);
+      } else {
+        Jitcc.invoke(&SlotGetSomeAttrsInt, jit::imm(slot_getsomeattrs_int),
+                     jit::FuncSignature::build<void, TupleTableSlot *, int>());
+        SlotGetSomeAttrsInt->setArg(0, SlotAddr);
+        SlotGetSomeAttrsInt->setArg(1, jit::imm(Op->d.fetch.last_var));
+      }
+
       break;
     }
 
@@ -368,7 +383,6 @@ bool AsmJitCompileExpr(ExprState *State) {
       ExecEvalSysVarFunc->setArg(1, jit::imm(Op));
       ExecEvalSysVarFunc->setArg(2, EContextAddr);
       ExecEvalSysVarFunc->setArg(3, SlotAddr);
-
       break;
     }
 
@@ -696,26 +710,14 @@ bool AsmJitCompileExpr(ExprState *State) {
 
   Jitcc.finalize();
 
-  instr_time CodeEmissionStartTime, CodeEmissionEndTime;
-  ExprStateEvalFunc EvalFunc;
-  INSTR_TIME_SET_CURRENT(CodeEmissionStartTime);
-  jit::Error err = Runtime.add(&EvalFunc, &Code);
-  if (err) {
-    ereport(LOG,
-            (errmsg("Jit failed: %s", jit::DebugUtils::errorAsString(err))));
+  ExprStateEvalFunc EvalFunc =
+      (ExprStateEvalFunc)EmitJittedFunction(Context, Code);
+  if (!EvalFunc)
     return false;
-  }
-  INSTR_TIME_SET_CURRENT(CodeEmissionEndTime);
-  INSTR_TIME_ACCUM_DIFF(Context->base.instr.emission_counter,
-                        CodeEmissionEndTime, CodeEmissionStartTime);
 
   {
-    MemoryContext OldContext = MemoryContextSwitchTo(TopMemoryContext);
     State->evalfunc = ExecCompiledExpr;
     State->evalfunc_private = (void *)EvalFunc;
-    Context->funcs = lappend(Context->funcs, (void *)EvalFunc);
-    Context->base.instr.created_functions++;
-    MemoryContextSwitchTo(OldContext);
   }
 
   INSTR_TIME_SET_CURRENT(CodeGenEndTime);
@@ -724,4 +726,28 @@ bool AsmJitCompileExpr(ExprState *State) {
 
   return true;
 }
+}
+
+void *EmitJittedFunction(AsmJitContext *Context, jit::CodeHolder &Code) {
+  instr_time CodeEmissionStartTime, CodeEmissionEndTime;
+  void *EmittedFunc;
+  INSTR_TIME_SET_CURRENT(CodeEmissionStartTime);
+  jit::Error err = Runtime.add(&EmittedFunc, &Code);
+  if (err) {
+    ereport(LOG,
+            (errmsg("Jit failed: %s", jit::DebugUtils::errorAsString(err))));
+    return nullptr;
+  }
+  INSTR_TIME_SET_CURRENT(CodeEmissionEndTime);
+  INSTR_TIME_ACCUM_DIFF(Context->base.instr.emission_counter,
+                        CodeEmissionEndTime, CodeEmissionStartTime);
+
+  {
+    MemoryContext OldContext = MemoryContextSwitchTo(TopMemoryContext);
+    Context->funcs = lappend(Context->funcs, EmittedFunc);
+    Context->base.instr.created_functions++;
+    MemoryContextSwitchTo(OldContext);
+  }
+
+  return EmittedFunc;
 }

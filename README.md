@@ -7,7 +7,7 @@
 
 ## Requirements
 
-- PostgreSQL 15.
+- PostgreSQL 17 https://github.com/postgres/postgres/commit/06a0f4d52be3a52a74725dd29c66cd486256a209.
 
 ## Build
 

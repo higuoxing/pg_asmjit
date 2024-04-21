@@ -10,6 +10,8 @@ extern "C" {
 
 #include "postgres.h"
 
+#include "access/htup_details.h"
+#include "access/tupdesc_details.h"
 #include "executor/execExpr.h"
 #include "executor/tuptable.h"
 #include "fmgr.h"
@@ -23,9 +25,25 @@ extern "C" {
 #include "utils/palloc.h"
 #include "utils/resowner.h"
 
+namespace jit = asmjit;
+
+typedef struct AsmJitContext {
+  JitContext base;
+  List *funcs;
+} AsmJitContext;
+
 extern bool AsmJitCompileExpr(ExprState *State);
 extern void AsmJitReleaseContext(JitContext *Ctx);
 extern void AsmJitResetAfterError(void);
+
+extern void *EmitJittedFunction(AsmJitContext *Context, jit::CodeHolder &Code);
+
+typedef void (*TupleDeformingFunc)(TupleTableSlot *);
+TupleDeformingFunc CompileTupleDeformingFunc(AsmJitContext *Context,
+                                             jit::JitRuntime &Runtime,
+                                             TupleDesc Desc,
+                                             const TupleTableSlotOps *TtsOps,
+                                             int NAttrs);
 }
 
 #endif
