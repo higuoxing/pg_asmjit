@@ -2,48 +2,31 @@ name: Build and Test
 on: [push, pull_request]
 jobs:
   ubuntu:
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-22.04
     if: ${{ !startsWith(github.ref_name, 'mac') && !startsWith(github.ref_name, 'windows') }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - postgres: 17
-            os: ubuntu-22.04
     steps:
-      - uses: ankane/setup-postgres@v1
-        with:
-          postgres-version: ${{ matrix.postgres }}
-          dev-files: true
-          config: |
-            jit_above_cost=0
-            jit=on
-            jit_provider='asmjit'
       - uses: actions/checkout@v4
         with:
           submodules: true
       - run: |
+          # Install PostgreSQL server.
           git clone https://github.com/postgres/postgres --depth=1 pg
-      - run: make
-        env:
-          PG_CFLAGS: -Wall -Wextra -Werror -Wno-unused-parameter -Wno-sign-compare
-      - run: |
-          export PG_CONFIG=`which pg_config`
-          sudo --preserve-env=PG_CONFIG make install
-      - run: |
-          sudo systemctl stop postgresql@${{ matrix.postgres }}-main
-          sudo usermod -a -G docker postgres
-          mkdir -p pg/src/test/regress/results
-          sudo chmod 0777 -R pg/src/test/regress/
-
-          initdb -D/tmp/data -c unix_socket_directories=/tmp
-          echo "jit='on'" >> /tmp/data/postgresql.conf
-          echo "jit_provider='asmjit'" >> /tmp/data/postgresql.conf
-          echo "jit_above_cost=0" >> /tmp/data/postgresql.conf
-          pg_ctl -D/tmp/data -l/tmp/logfile start
-
           cd pg
-          ./configure --prefix=/usr/lib/postgresql/${{ matrix.postgres }}
-          PGPORT=5432 PGHOST=127.0.0.1 make installcheck
+          ./configure --prefix=$HOME/.local/pg --enable-cassert --enable-debug
+          make install-world-bin -j4
+          # Install pg_asmjit.
+          cd ..
+          PATH=$HOME/.local/pg/bin:$PATH make install -j4
+      - run: |
+             export PATH=$HOME/.local/pg/bin:$PATH
+             initdb -D/tmp/data -c unix_socket_directories=/tmp
+             echo "jit='on'" >> /tmp/data/postgresql.conf
+             echo "jit_provider='asmjit'" >> /tmp/data/postgresql.conf
+             echo "jit_above_cost=0" >> /tmp/data/postgresql.conf
+             pg_ctl -D/tmp/data -l/tmp/logfile start
+             cd pg
+             PGPORT=5432 PGHOST=127.0.0.1 make installcheck
       - if: ${{ failure() }}
         uses: mxschmitt/action-tmate@v3
