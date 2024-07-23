@@ -9,10 +9,10 @@ static bool JitSessionInitialized = false;
 static jit::JitRuntime Runtime;
 
 static void ResOwnerReleaseJitContext(Datum res) {
-  JitContext *context = (JitContext *)DatumGetPointer(res);
+  AsmJitContext *Context = (AsmJitContext *)DatumGetPointer(res);
 
-  context->resowner = NULL;
-  jit_release_context(context);
+  Context->resowner = NULL;
+  jit_release_context((JitContext *)Context);
 }
 
 static const ResourceOwnerDesc jit_resowner_desc = {
@@ -54,12 +54,11 @@ void AsmJitReleaseContext(JitContext *Ctx) {
   list_free(Context->funcs);
   Context->funcs = NIL;
 
-  if (Context->base.resowner)
-    ResourceOwnerForgetJIT(Context->base.resowner, Context);
+  if (Context->resowner)
+    ResourceOwnerForgetJIT(Context->resowner, Context);
 }
 
-void AsmJitResetAfterError(void) { /* TODO */
-}
+void AsmJitResetAfterError(void) { /* TODO */ }
 
 static void JitInitializeSession(void) {
   if (JitSessionInitialized)
@@ -79,7 +78,7 @@ static AsmJitContext *JitCreateContext(int JitFlags) {
   Context->funcs = NIL;
 
   /* ensure cleanup */
-  Context->base.resowner = CurrentResourceOwner;
+  Context->resowner = CurrentResourceOwner;
   ResourceOwnerRememberJIT(CurrentResourceOwner, Context);
 
   return Context;

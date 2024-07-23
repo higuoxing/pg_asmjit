@@ -29,6 +29,7 @@ namespace jit = asmjit;
 
 typedef struct AsmJitContext {
   JitContext base;
+  ResourceOwner resowner;
   List *funcs;
 } AsmJitContext;
 
