@@ -1,3 +1,4 @@
+#include "asmjit/x86/x86compiler.h"
 #include "asmjit_common.h"
 
 namespace jit = asmjit;
@@ -108,6 +109,20 @@ static Datum ExecCompiledExpr(ExprState *State, ExprContext *EContext,
   }
 #include "jit_types_info.inc"
 #undef TYPES_INFO
+
+static inline void JitLoadFromArray(x86::Compiler &cc, x86::Gp &Array,
+                                    size_t Index, x86::Gp &Elem,
+                                    size_t ElemSize) {
+  x86::Mem ElemPtr = x86::ptr(Array, Index * ElemSize, sizeof(ElemSize));
+  cc.mov(Elem, ElemPtr);
+}
+
+static inline void JitStoreToArray(x86::Compiler &cc, x86::Gp &Array,
+                                   size_t Index, x86::Gp &Elem,
+                                   size_t ElemSize) {
+  x86::Mem ElemPtr = x86::ptr(Array, Index * ElemSize, sizeof(ElemSize));
+  cc.mov(ElemPtr, Elem);
+}
 
 bool AsmJitCompileExpr(ExprState *State) {
   PlanState *Parent = State->parent;
@@ -356,17 +371,13 @@ bool AsmJitCompileExpr(ExprState *State) {
       Jitcc.mov(SlotIsNulls, SlotIsNullsPtr);
 
       int Attrnum = Op->d.var.attnum;
-      x86::Mem SlotValuePtr =
-          x86::ptr(SlotValues, Attrnum * sizeof(Datum), sizeof(Datum));
-      x86::Mem SlotIsNullPtr =
-          x86::ptr(SlotIsNulls, Attrnum * sizeof(bool), sizeof(bool));
 
-      x86::Gp SlotValue = Jitcc.newUIntPtr(), SlotIsnull = Jitcc.newInt8();
-      Jitcc.mov(SlotValue, SlotValuePtr);
-      Jitcc.mov(SlotIsnull, SlotIsNullPtr);
+      x86::Gp SlotValue = Jitcc.newUIntPtr(), SlotIsNull = Jitcc.newInt8();
+      JitLoadFromArray(Jitcc, SlotValues, Attrnum, SlotValue, sizeof(Datum));
+      JitLoadFromArray(Jitcc, SlotIsNulls, Attrnum, SlotIsNull, sizeof(bool));
 
       Jitcc.mov(ResValuePtr, SlotValue);
-      Jitcc.mov(ResNullPtr, SlotIsnull);
+      Jitcc.mov(ResNullPtr, SlotIsNull);
 
       break;
     }
@@ -417,26 +428,19 @@ bool AsmJitCompileExpr(ExprState *State) {
       Jitcc.mov(SlotIsNulls, SlotIsNullsPtr);
 
       int Attrnum = Op->d.assign_var.attnum;
-      x86::Mem SlotValuePtr =
-          x86::ptr(SlotValues, Attrnum * sizeof(Datum), sizeof(Datum));
-      x86::Mem SlotIsNullPtr =
-          x86::ptr(SlotIsNulls, Attrnum * sizeof(bool), sizeof(bool));
 
       /* Load data. */
-      x86::Gp SlotValue = Jitcc.newUIntPtr(), SlotIsnull = Jitcc.newInt8();
-      Jitcc.mov(SlotValue, SlotValuePtr);
-      Jitcc.mov(SlotIsnull, SlotIsNullPtr);
+      x86::Gp SlotValue = Jitcc.newUIntPtr(), SlotIsNull = Jitcc.newInt8();
+      JitLoadFromArray(Jitcc, SlotValues, Attrnum, SlotValue, sizeof(Datum));
+      JitLoadFromArray(Jitcc, SlotIsNulls, Attrnum, SlotIsNull, sizeof(bool));
 
-      /* Compute addresses of targets. */
+      /* Save the result. */
       int Resultnum = Op->d.assign_var.resultnum;
       Jitcc.mov(SlotValues, ResultTupleValuesPtr);
       Jitcc.mov(SlotIsNulls, ResultTupleIsNullsPtr);
-      x86::Mem ResultValuePtr =
-          x86::ptr(SlotValues, Resultnum * sizeof(Datum), sizeof(Datum));
-      x86::Mem ResultNullPtr =
-          x86::ptr(SlotIsNulls, Resultnum * sizeof(bool), sizeof(bool));
-      Jitcc.mov(ResultValuePtr, SlotValue);
-      Jitcc.mov(ResultNullPtr, SlotIsnull);
+
+      JitStoreToArray(Jitcc, SlotValues, Resultnum, SlotValue, sizeof(Datum));
+      JitStoreToArray(Jitcc, SlotIsNulls, Resultnum, SlotIsNull, sizeof(bool));
 
       break;
     }
@@ -460,15 +464,12 @@ bool AsmJitCompileExpr(ExprState *State) {
               ResultIsNulls = Jitcc.newUIntPtr();
       Jitcc.mov(ResultValues, ResultTupleValuesPtr);
       Jitcc.mov(ResultIsNulls, ResultTupleIsNullsPtr);
-      x86::Mem ResultValuePtr = x86::ptr(
-                   ResultValues, sizeof(Datum) * ResultNum, sizeof(Datum)),
-               ResultIsNullPtr = x86::ptr(
-                   ResultIsNulls, sizeof(bool) * ResultNum, sizeof(bool));
 
       /*
        * Store nullness.
        */
-      Jitcc.mov(ResultIsNullPtr, TempStateResnull);
+      JitStoreToArray(Jitcc, ResultIsNulls, ResultNum, TempStateResnull,
+                      sizeof(bool));
 
       if (Opcode == EEOP_ASSIGN_TMP_MAKE_RO) {
         Jitcc.cmp(TempStateResnull, jit::imm(1));
@@ -483,7 +484,8 @@ bool AsmJitCompileExpr(ExprState *State) {
       }
 
       /* Finally, store the result. */
-      Jitcc.mov(ResultValuePtr, TempStateResvalue);
+      JitStoreToArray(Jitcc, ResultValues, ResultNum, TempStateResvalue,
+                      sizeof(Datum));
       break;
     }
     case EEOP_CONST: {
