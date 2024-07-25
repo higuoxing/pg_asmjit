@@ -1,0 +1,5 @@
+// TYPES_INFO(struct_type, member_type, member_name, reg_type)
+TYPES_INFO(ExprContext, TupleTableSlot *, ecxt_scantuple, UIntPtr)
+TYPES_INFO(ExprContext, TupleTableSlot *, ecxt_innertuple, UIntPtr)
+TYPES_INFO(ExprContext, TupleTableSlot *, ecxt_outertuple, UIntPtr)
+TYPES_INFO(TupleTableSlot, AttrNumber, tts_nvalid, Int16)
