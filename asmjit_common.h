@@ -47,4 +47,34 @@ TupleDeformingFunc CompileTupleDeformingFunc(AsmJitContext *Context,
                                              int NAttrs);
 }
 
+#define TYPES_INFO(struct_type, member_type, member_name, reg_type)            \
+  static inline jit::x86::Gp emit_load_##member_name##_from_##struct_type(     \
+      jit::x86::Compiler &cc, jit::x86::Gp &object_addr) {                     \
+    jit::x86::Mem member_ptr = jit::x86::ptr(                                  \
+        object_addr, offsetof(struct_type, member_name), sizeof(member_type)); \
+    jit::x86::Gp member = cc.new##reg_type(#struct_type "_" #member_name);     \
+    cc.mov(member, member_ptr);                                                \
+    return member;                                                             \
+  }
+#include "jit_types_info.inc"
+#undef TYPES_INFO
+
+#define TYPES_INFO(struct_type, member_type, member_name, reg_type)            \
+  static inline void emit_store_##member_name##_of_##struct_type(              \
+      jit::x86::Compiler &cc, jit::x86::Gp &object_addr,                       \
+      const jit::Imm &val) {                                                   \
+    jit::x86::Mem member_ptr = jit::x86::ptr(                                  \
+        object_addr, offsetof(struct_type, member_name), sizeof(member_type)); \
+    cc.mov(member_ptr, val);                                                   \
+  }                                                                            \
+  static inline void emit_store_##member_name##_of_##struct_type(              \
+      jit::x86::Compiler &cc, jit::x86::Gp &object_addr,                       \
+      const jit::x86::Gp &val) {                                               \
+    jit::x86::Mem member_ptr = jit::x86::ptr(                                  \
+        object_addr, offsetof(struct_type, member_name), sizeof(member_type)); \
+    cc.mov(member_ptr, val);                                                   \
+  }
+#include "jit_types_info.inc"
+#undef TYPES_INFO
+
 #endif
