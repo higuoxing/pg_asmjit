@@ -59,7 +59,8 @@ void AsmJitReleaseContext(JitContext *Ctx) {
     ResourceOwnerForgetJIT(Context->resowner, Context);
 }
 
-void AsmJitResetAfterError(void) { /* TODO */ }
+void AsmJitResetAfterError(void) { /* TODO */
+}
 
 static void JitInitializeSession(void) {
   if (JitSessionInitialized)
@@ -165,16 +166,16 @@ bool AsmJitCompileExpr(ExprState *State) {
   JittedFunc->setArg(1, EContext);
   JittedFunc->setArg(2, IsNull);
 
-  jit::Label *Opblocks =
+  jit::Label *L_Opblocks =
       (jit::Label *)palloc(State->steps_len * sizeof(jit::Label));
   for (int OpIndex = 0; OpIndex < State->steps_len; ++OpIndex)
-    Opblocks[OpIndex] = Jitcc.newLabel();
+    L_Opblocks[OpIndex] = Jitcc.newLabel();
 
   for (int OpIndex = 0; OpIndex < State->steps_len; ++OpIndex) {
     ExprEvalStep *Op = &State->steps[OpIndex];
     ExprEvalOp Opcode = ExecEvalStepOp(State, Op);
 
-    Jitcc.bind(Opblocks[OpIndex]);
+    Jitcc.bind(L_Opblocks[OpIndex]);
 
 #define BuildEvalXFunc2(Func)                                                  \
   do {                                                                         \
@@ -240,7 +241,7 @@ bool AsmJitCompileExpr(ExprState *State) {
        * required.
        */
       Jitcc.cmp(TtsNvalid, jit::imm(Op->d.fetch.last_var));
-      Jitcc.jge(Opblocks[OpIndex + 1]);
+      Jitcc.jge(L_Opblocks[OpIndex + 1]);
 
       if (TtsOps && Desc && (Context->base.flags & PGJIT_DEFORM)) {
         INSTR_TIME_SET_CURRENT(DeformStartTime);
@@ -398,7 +399,7 @@ bool AsmJitCompileExpr(ExprState *State) {
 
       if (Opcode == EEOP_ASSIGN_TMP_MAKE_RO) {
         Jitcc.cmp(Resnull, jit::imm(1));
-        Jitcc.je(Opblocks[OpIndex + 1]);
+        Jitcc.je(L_Opblocks[OpIndex + 1]);
 
         jit::InvokeNode *MakeExpandedObjectReadOnlyInternalFunc;
         Jitcc.invoke(&MakeExpandedObjectReadOnlyInternalFunc,
@@ -441,10 +442,10 @@ bool AsmJitCompileExpr(ExprState *State) {
       x86::Gp FuncCallInfoAddr = Jitcc.newUIntPtr();
       Jitcc.mov(FuncCallInfoAddr, FuncCallInfo);
 
-      jit::Label InvokePGFunc = Jitcc.newLabel();
+      jit::Label L_InvokePGFunc = Jitcc.newLabel();
 
       if (Opcode == EEOP_FUNCEXPR_STRICT) {
-        jit::Label StrictFail = Jitcc.newLabel();
+        jit::Label L_StrictFail = Jitcc.newLabel();
         /* Should make sure that they're optimized beforehand. */
         int ArgsNum = Op->d.func.nargs;
         if (ArgsNum == 0) {
@@ -463,24 +464,24 @@ bool AsmJitCompileExpr(ExprState *State) {
           x86::Gp FuncCallInfoArgNIsNull = Jitcc.newInt8();
           Jitcc.mov(FuncCallInfoArgNIsNull, FuncCallInfoArgNIsNullPtr);
           Jitcc.cmp(FuncCallInfoArgNIsNull, jit::imm(1));
-          Jitcc.je(StrictFail);
+          Jitcc.je(L_StrictFail);
         }
 
-        Jitcc.jmp(InvokePGFunc);
+        Jitcc.jmp(L_InvokePGFunc);
 
-        Jitcc.bind(StrictFail);
+        Jitcc.bind(L_StrictFail);
         /* Op->resnull = true */
         x86::Gp OpResNull = Jitcc.newUIntPtr("op.resnull");
         Jitcc.mov(OpResNull, jit::imm(Op->resnull));
         x86::Mem OpResNullPtr = x86::ptr(OpResNull, 0, sizeof(bool));
         Jitcc.mov(OpResNullPtr, jit::imm(1));
-        Jitcc.jmp(Opblocks[OpIndex + 1]);
+        Jitcc.jmp(L_Opblocks[OpIndex + 1]);
       }
 
       /*
        * Before invoking PGFuncs, we should set FuncCallInfo->isnull to false.
        */
-      Jitcc.bind(InvokePGFunc);
+      Jitcc.bind(L_InvokePGFunc);
       x86::Mem FuncCallInfoIsNullPtr =
           x86::ptr(FuncCallInfoAddr, offsetof(FunctionCallInfoBaseData, isnull),
                    sizeof(bool));
@@ -519,7 +520,7 @@ bool AsmJitCompileExpr(ExprState *State) {
     }
 
     case EEOP_QUAL: {
-      jit::Label HandleNullOrFalse = Jitcc.newLabel();
+      jit::Label L_HandleNullOrFalse = Jitcc.newLabel();
 
       x86::Gp Resvalue = Jitcc.newUIntPtr(), Resnull = Jitcc.newInt8();
       x86::Gp OpResValue = Jitcc.newUIntPtr("op.resvalue"),
@@ -532,21 +533,21 @@ bool AsmJitCompileExpr(ExprState *State) {
       Jitcc.mov(Resnull, OpResNullPtr);
 
       Jitcc.cmp(Resnull, jit::imm(1));
-      Jitcc.je(HandleNullOrFalse);
+      Jitcc.je(L_HandleNullOrFalse);
 
       Jitcc.cmp(Resvalue, jit::imm(0));
-      Jitcc.je(HandleNullOrFalse);
+      Jitcc.je(L_HandleNullOrFalse);
 
-      Jitcc.jmp(Opblocks[OpIndex + 1]);
+      Jitcc.jmp(L_Opblocks[OpIndex + 1]);
 
       /* Handling null or false. */
-      Jitcc.bind(HandleNullOrFalse);
+      Jitcc.bind(L_HandleNullOrFalse);
 
       /* Set resnull and resvalue to false. */
       Jitcc.mov(OpResValuePtr, jit::imm(0));
       Jitcc.mov(OpResNullPtr, jit::imm(0));
 
-      Jitcc.jmp(Opblocks[Op->d.qualexpr.jumpdone]);
+      Jitcc.jmp(L_Opblocks[Op->d.qualexpr.jumpdone]);
 
       break;
     }
