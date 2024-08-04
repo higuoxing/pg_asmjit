@@ -12,6 +12,7 @@ extern "C" {
 
 #include "access/htup_details.h"
 #include "access/tupdesc_details.h"
+#include "catalog/pg_attribute.h"
 #include "executor/execExpr.h"
 #include "executor/tuptable.h"
 #include "fmgr.h"
@@ -46,5 +47,17 @@ TupleDeformingFunc CompileTupleDeformingFunc(AsmJitContext *Context,
                                              const TupleTableSlotOps *TtsOps,
                                              int NAttrs);
 }
+
+#define TYPES_INFO(struct_type, member_type, member_name, reg_type)            \
+  static inline jit::x86::Gp emit_load_##member_name##_from_##struct_type(     \
+      jit::x86::Compiler &cc, jit::x86::Gp &object_addr) {                     \
+    jit::x86::Mem member_ptr = jit::x86::ptr(                                  \
+        object_addr, offsetof(struct_type, member_name), sizeof(member_type)); \
+    jit::x86::Gp member = cc.new##reg_type(#struct_type "_" #member_name);     \
+    cc.mov(member, member_ptr);                                                \
+    return member;                                                             \
+  }
+#include "jit_types_info.inc"
+#undef TYPES_INFO
 
 #endif

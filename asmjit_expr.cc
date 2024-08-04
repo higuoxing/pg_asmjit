@@ -99,18 +99,6 @@ static Datum ExecCompiledExpr(ExprState *State, ExprContext *EContext,
   return Func(State, EContext, IsNull);
 }
 
-#define TYPES_INFO(struct_type, member_type, member_name, reg_type)            \
-  static inline x86::Gp emit_load_##member_name##_from_##struct_type(          \
-      x86::Compiler &cc, x86::Gp &object_addr) {                               \
-    x86::Mem member_ptr = x86::ptr(                                            \
-        object_addr, offsetof(struct_type, member_name), sizeof(member_type)); \
-    x86::Gp member = cc.new##reg_type(#struct_type "_" #member_name);          \
-    cc.mov(member, member_ptr);                                                \
-    return member;                                                             \
-  }
-#include "jit_types_info.inc"
-#undef TYPES_INFO
-
 static inline void EmitLoadFromArray(x86::Compiler &cc, x86::Gp &Array,
                                      size_t Index, x86::Gp &Elem,
                                      size_t ElemSize) {
