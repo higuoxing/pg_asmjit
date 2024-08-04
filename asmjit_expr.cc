@@ -228,6 +228,7 @@ bool AsmJitCompileExpr(ExprState *State) {
 
       jit::InvokeNode *SlotGetSomeAttrsInt = nullptr;
       if (CompiledTupleDeformingFunc) {
+        /* Invoke the JIT-ed deforming function. */
         Jitcc.invoke(&SlotGetSomeAttrsInt, jit::imm(CompiledTupleDeformingFunc),
                      jit::FuncSignature::build<void, TupleTableSlot *>());
         SlotGetSomeAttrsInt->setArg(0, Slot);
