@@ -47,4 +47,46 @@ TupleDeformingFunc CompileTupleDeformingFunc(AsmJitContext *Context,
                                              int NAttrs);
 }
 
+#define TYPES_INFO(struct_type, member_type, member_name, reg_type)            \
+  static inline jit::x86::Gp emit_load_##member_name##_from_##struct_type(     \
+      jit::x86::Compiler &cc, jit::x86::Gp &object_addr) {                     \
+    jit::x86::Mem member_ptr = jit::x86::ptr(                                  \
+        object_addr, offsetof(struct_type, member_name), sizeof(member_type)); \
+    jit::x86::Gp member = cc.new##reg_type(#struct_type "_" #member_name);     \
+    cc.mov(member, member_ptr);                                                \
+    return member;                                                             \
+  }
+#include "jit_types_info.inc"
+#undef TYPES_INFO
+
+#define LOAD_STORE_CONST(CType, JitType)                                       \
+  static inline jit::x86::Gp EmitLoadConst##JitType(                           \
+      jit::x86::Compiler &cc, const char *fmt, CType c) {                      \
+    jit::x86::Gp JitReg = cc.new##JitType(fmt);                                \
+    cc.mov(JitReg, jit::imm(c));                                               \
+    return JitReg;                                                             \
+  }
+LOAD_STORE_CONST(uint8, UInt8)
+LOAD_STORE_CONST(uint32, UInt32)
+LOAD_STORE_CONST(void *, UIntPtr)
+LOAD_STORE_CONST(uint64, UInt64)
+#undef LOAD_STORE_CONST
+
+static inline void EmitLoadFromArray(jit::x86::Compiler &cc,
+                                     jit::x86::Gp &Array, size_t Index,
+                                     jit::x86::Gp &Elem, size_t ElemSize) {
+  jit::x86::Mem ElemPtr =
+      jit::x86::ptr(Array, Index * ElemSize, sizeof(ElemSize));
+  cc.mov(Elem, ElemPtr);
+}
+
+template <typename T>
+static inline void EmitStoreToArray(jit::x86::Compiler &cc, jit::x86::Gp &Array,
+                                    size_t Index, const T &Elem,
+                                    size_t ElemSize) {
+  jit::x86::Mem ElemPtr =
+      jit::x86::ptr(Array, Index * ElemSize, sizeof(ElemSize));
+  cc.mov(ElemPtr, Elem);
+}
+
 #endif
