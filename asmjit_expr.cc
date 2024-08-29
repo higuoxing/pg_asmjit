@@ -131,9 +131,9 @@ bool AsmJitCompileExpr(ExprState *State) {
   jit::FuncNode *JittedFunc = Jitcc.addFunc(
       jit::FuncSignature::build<Datum, ExprState *, ExprContext *, bool *>());
 
-  x86::Gp Expression = Jitcc.newUIntPtr("expression"),
-          EContext = Jitcc.newUIntPtr("econtext"),
-          IsNull = Jitcc.newUIntPtr("isnull");
+  x86::Gp Expression = Jitcc.newUIntPtr("expression.uintptr"),
+          EContext = Jitcc.newUIntPtr("econtext.uintptr"),
+          IsNull = Jitcc.newUIntPtr("isnull.uintptr");
 
   JittedFunc->setArg(0, Expression);
   JittedFunc->setArg(1, EContext);
@@ -169,6 +169,12 @@ bool AsmJitCompileExpr(ExprState *State) {
     JitFunc->setArg(0, Expression);                                            \
     JitFunc->setArg(1, jit::imm(Op));                                          \
     JitFunc->setArg(2, EContext);                                              \
+  } while (0);
+
+#define todo()                                                                 \
+  do {                                                                         \
+    elog(LOG, "TODO: Opcode (%d)", Opcode);                                    \
+    return false;                                                              \
   } while (0);
 
     switch (Opcode) {
@@ -265,10 +271,10 @@ bool AsmJitCompileExpr(ExprState *State) {
       EmitLoadFromArray(Jitcc, SlotValues, Attrnum, SlotValue, sizeof(Datum));
       EmitLoadFromArray(Jitcc, SlotIsNulls, Attrnum, SlotIsNull, sizeof(bool));
 
-      x86::Gp OpResvalue =
-                  EmitLoadConstUIntPtr(Jitcc, "op.resvalue", Op->resvalue),
-              OpResnull =
-                  EmitLoadConstUIntPtr(Jitcc, "op.resnull", Op->resnull);
+      x86::Gp OpResvalue = EmitLoadConstUIntPtr(Jitcc, "op.resvalue.uintptr",
+                                                Op->resvalue),
+              OpResnull = EmitLoadConstUIntPtr(Jitcc, "op.resnull.uintptr",
+                                               Op->resnull);
 
       EmitStoreToArray(Jitcc, OpResvalue, 0, SlotValue, sizeof(Datum));
       EmitStoreToArray(Jitcc, OpResnull, 0, SlotIsNull, sizeof(bool));
@@ -324,8 +330,8 @@ bool AsmJitCompileExpr(ExprState *State) {
       int Attrnum = Op->d.assign_var.attnum;
 
       /* Load data. */
-      x86::Gp SlotValue = Jitcc.newUIntPtr("slotvalue"),
-              SlotIsNull = Jitcc.newInt8("slotisnull");
+      x86::Gp SlotValue = Jitcc.newUIntPtr("slotvalue.uintptr"),
+              SlotIsNull = Jitcc.newInt8("slotisnull.i8");
       EmitLoadFromArray(Jitcc, SlotValues, Attrnum, SlotValue, sizeof(Datum));
       EmitLoadFromArray(Jitcc, SlotIsNulls, Attrnum, SlotIsNull, sizeof(bool));
 
@@ -385,19 +391,19 @@ bool AsmJitCompileExpr(ExprState *State) {
       break;
     }
     case EEOP_CONST: {
-      x86::Gp ConstVal = EmitLoadConstUInt64(Jitcc, "constval.value",
+      x86::Gp ConstVal = EmitLoadConstUInt64(Jitcc, "constval.value.u64",
                                              Op->d.constval.value),
-              ConstNull = EmitLoadConstUInt8(Jitcc, "constval.isnull",
+              ConstNull = EmitLoadConstUInt8(Jitcc, "constval.isnull.u8",
                                              Op->d.constval.isnull);
 
       /*
        * Store Op->d.constval.value to Op->resvalue.
        * Store Op->d.constval.isnull to Op->resnull.
        */
-      x86::Gp OpResvalue =
-                  EmitLoadConstUIntPtr(Jitcc, "op.resvalue", Op->resvalue),
-              OpResnull =
-                  EmitLoadConstUIntPtr(Jitcc, "op.resnull", Op->resnull);
+      x86::Gp OpResvalue = EmitLoadConstUIntPtr(Jitcc, "op.resvalue.uintptr",
+                                                Op->resvalue),
+              OpResnull = EmitLoadConstUIntPtr(Jitcc, "op.resnull.uintptr",
+                                               Op->resnull);
       EmitStoreToArray(Jitcc, OpResvalue, 0, ConstVal, sizeof(Datum));
       EmitStoreToArray(Jitcc, OpResnull, 0, ConstNull, sizeof(bool));
 
@@ -439,7 +445,7 @@ bool AsmJitCompileExpr(ExprState *State) {
         Jitcc.bind(L_StrictFail);
         /* Op->resnull = true */
         x86::Gp OpResNull =
-            EmitLoadConstUIntPtr(Jitcc, "op.resnull", Op->resnull);
+            EmitLoadConstUIntPtr(Jitcc, "op.resnull.uintptr", Op->resnull);
         EmitStoreToArray(Jitcc, OpResNull, 0, jit::imm(1), sizeof(bool));
         Jitcc.jmp(L_Opblocks[OpIndex + 1]);
       }
@@ -461,10 +467,10 @@ bool AsmJitCompileExpr(ExprState *State) {
       PGFunc->setRet(0, RetValue);
 
       /* Write result values. */
-      x86::Gp OpResValue =
-                  EmitLoadConstUIntPtr(Jitcc, "op.resvalue", Op->resvalue),
-              OpResNull =
-                  EmitLoadConstUIntPtr(Jitcc, "op.resnull", Op->resnull);
+      x86::Gp OpResValue = EmitLoadConstUIntPtr(Jitcc, "op.resvalue.uintptr",
+                                                Op->resvalue),
+              OpResNull = EmitLoadConstUIntPtr(Jitcc, "op.resnull.uintptr",
+                                               Op->resnull);
 
       EmitStoreToArray(Jitcc, OpResValue, 0, RetValue, sizeof(Datum));
       x86::Gp FuncCallInfoIsNull = Jitcc.newInt8();
@@ -483,16 +489,40 @@ bool AsmJitCompileExpr(ExprState *State) {
       BuildEvalXFunc3(ExecEvalFuncExprStrictFusage);
       break;
     }
+      /*
+       * Treat them the same for now, optimizer can remove
+       * redundancy. Could be worthwhile to optimize during emission
+       * though.
+       */
+    case EEOP_BOOL_AND_STEP_FIRST:
+    case EEOP_BOOL_AND_STEP:
+    case EEOP_BOOL_AND_STEP_LAST: {
+      todo();
+    }
+      /*
+       * Treat them the same for now, optimizer can remove
+       * redundancy. Could be worthwhile to optimize during emission
+       * though.
+       */
+    case EEOP_BOOL_OR_STEP_FIRST:
+    case EEOP_BOOL_OR_STEP:
+    case EEOP_BOOL_OR_STEP_LAST: {
+      todo();
+    }
+
+    case EEOP_BOOL_NOT_STEP: {
+      todo();
+    }
 
     case EEOP_QUAL: {
       jit::Label L_HandleNullOrFalse = Jitcc.newLabel();
 
-      x86::Gp OpResvalue =
-                  EmitLoadConstUIntPtr(Jitcc, "op.resvalue", Op->resvalue),
-              OpResnull =
-                  EmitLoadConstUIntPtr(Jitcc, "op.resnull", Op->resnull);
-      x86::Gp Resvalue = Jitcc.newUIntPtr("resvalue"),
-              Resnull = Jitcc.newInt8("resnull");
+      x86::Gp OpResvalue = EmitLoadConstUIntPtr(Jitcc, "op.resvalue.uintptr",
+                                                Op->resvalue),
+              OpResnull = EmitLoadConstUIntPtr(Jitcc, "op.resnull.uintptr",
+                                               Op->resnull);
+      x86::Gp Resvalue = Jitcc.newUIntPtr("resvalue.uintptr"),
+              Resnull = Jitcc.newInt8("resnull.i8");
 
       EmitLoadFromArray(Jitcc, OpResvalue, 0, Resvalue, sizeof(Datum));
       EmitLoadFromArray(Jitcc, OpResnull, 0, Resnull, sizeof(bool));
@@ -515,6 +545,95 @@ bool AsmJitCompileExpr(ExprState *State) {
       Jitcc.jmp(L_Opblocks[Op->d.qualexpr.jumpdone]);
 
       break;
+    }
+
+    case EEOP_JUMP: {
+      todo();
+    }
+
+    case EEOP_JUMP_IF_NULL: {
+      todo();
+    }
+
+    case EEOP_JUMP_IF_NOT_NULL: {
+      todo();
+    }
+
+    case EEOP_JUMP_IF_NOT_TRUE: {
+      todo();
+    }
+
+    case EEOP_NULLTEST_ISNULL: {
+      todo();
+    }
+
+    case EEOP_NULLTEST_ISNOTNULL: {
+      todo();
+    }
+
+    case EEOP_NULLTEST_ROWISNULL: {
+      todo();
+    }
+
+    case EEOP_NULLTEST_ROWISNOTNULL: {
+      todo();
+    }
+
+    case EEOP_BOOLTEST_IS_TRUE:
+    case EEOP_BOOLTEST_IS_NOT_FALSE:
+    case EEOP_BOOLTEST_IS_FALSE:
+    case EEOP_BOOLTEST_IS_NOT_TRUE: {
+      todo();
+    }
+
+    case EEOP_PARAM_EXEC: {
+      todo();
+    }
+
+    case EEOP_PARAM_EXTERN: {
+      todo();
+    }
+
+    case EEOP_PARAM_CALLBACK: {
+      todo();
+    }
+
+    case EEOP_PARAM_SET: {
+      todo();
+    }
+
+    case EEOP_SBSREF_SUBSCRIPTS: {
+      todo();
+    }
+
+    case EEOP_SBSREF_OLD:
+    case EEOP_SBSREF_ASSIGN:
+    case EEOP_SBSREF_FETCH: {
+      todo();
+    }
+
+    case EEOP_CASE_TESTVAL: {
+      todo();
+    }
+    case EEOP_MAKE_READONLY: {
+      todo();
+    }
+
+    case EEOP_IOCOERCE: {
+      todo();
+    }
+
+    case EEOP_IOCOERCE_SAFE: {
+      todo();
+    }
+
+    case EEOP_DISTINCT:
+    case EEOP_NOT_DISTINCT: {
+      todo();
+    }
+
+    case EEOP_NULLIF: {
+      todo();
     }
 
     case EEOP_SQLVALUEFUNCTION: {
@@ -547,6 +666,14 @@ bool AsmJitCompileExpr(ExprState *State) {
       break;
     }
 
+    case EEOP_ROWCOMPARE_STEP: {
+      todo();
+    }
+
+    case EEOP_ROWCOMPARE_FINAL: {
+      todo();
+    }
+
     case EEOP_MINMAX: {
       BuildEvalXFunc2(ExecEvalMinMax);
       break;
@@ -567,6 +694,10 @@ bool AsmJitCompileExpr(ExprState *State) {
       break;
     }
 
+    case EEOP_DOMAIN_TESTVAL: {
+      todo();
+    }
+
     case EEOP_DOMAIN_NOTNULL: {
       BuildEvalXFunc2(ExecEvalConstraintNotNull);
       break;
@@ -575,6 +706,16 @@ bool AsmJitCompileExpr(ExprState *State) {
     case EEOP_DOMAIN_CHECK: {
       BuildEvalXFunc2(ExecEvalConstraintCheck);
       break;
+    }
+
+    case EEOP_HASHDATUM_SET_INITVAL: {
+      todo();
+    }
+    case EEOP_HASHDATUM_FIRST:
+    case EEOP_HASHDATUM_FIRST_STRICT:
+    case EEOP_HASHDATUM_NEXT32:
+    case EEOP_HASHDATUM_NEXT32_STRICT: {
+      todo();
     }
 
     case EEOP_CONVERT_ROWTYPE: {
@@ -597,14 +738,73 @@ bool AsmJitCompileExpr(ExprState *State) {
       break;
     }
 
+    case EEOP_JSON_CONSTRUCTOR: {
+      todo();
+    }
+
+    case EEOP_IS_JSON: {
+      todo();
+    }
+
+    case EEOP_JSONEXPR_PATH: {
+      todo();
+    }
+
+    case EEOP_JSONEXPR_COERCION: {
+      todo();
+    }
+    case EEOP_JSONEXPR_COERCION_FINISH: {
+      todo();
+    }
+
+    case EEOP_AGGREF: {
+      todo();
+    }
+
     case EEOP_GROUPING_FUNC: {
       BuildEvalXFunc2(ExecEvalGroupingFunc);
       break;
     }
 
+    case EEOP_WINDOW_FUNC: {
+      todo();
+    }
+
+    case EEOP_MERGE_SUPPORT_FUNC: {
+      todo();
+    }
+
     case EEOP_SUBPLAN: {
       BuildEvalXFunc3(ExecEvalSubPlan);
       break;
+    }
+
+    case EEOP_AGG_STRICT_DESERIALIZE:
+    case EEOP_AGG_DESERIALIZE: {
+      todo();
+    }
+
+    case EEOP_AGG_STRICT_INPUT_CHECK_ARGS:
+    case EEOP_AGG_STRICT_INPUT_CHECK_NULLS: {
+      todo();
+    }
+    case EEOP_AGG_PLAIN_PERGROUP_NULLCHECK: {
+      todo();
+    }
+
+    case EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYVAL:
+    case EEOP_AGG_PLAIN_TRANS_STRICT_BYVAL:
+    case EEOP_AGG_PLAIN_TRANS_BYVAL:
+    case EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYREF:
+    case EEOP_AGG_PLAIN_TRANS_STRICT_BYREF:
+    case EEOP_AGG_PLAIN_TRANS_BYREF: {
+      todo();
+    }
+    case EEOP_AGG_PRESORTED_DISTINCT_SINGLE: {
+      todo();
+    }
+    case EEOP_AGG_PRESORTED_DISTINCT_MULTI: {
+      todo();
     }
 
     case EEOP_AGG_ORDERED_TRANS_DATUM: {
@@ -622,9 +822,8 @@ bool AsmJitCompileExpr(ExprState *State) {
       break;
     }
 
-    default:
-      ereport(LOG, (errmsg("Jit for operator (%d) is not supported", Opcode)));
-      return false;
+      /* Don't need a default case, since we want to know if any case is
+       * missing. */
     }
   }
 
