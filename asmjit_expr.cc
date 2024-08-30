@@ -1,5 +1,6 @@
 #include "asmjit/x86/x86compiler.h"
 #include "asmjit_common.h"
+#include "executor/execExpr.h"
 
 namespace jit = asmjit;
 namespace x86 = asmjit::x86;
@@ -497,7 +498,59 @@ bool AsmJitCompileExpr(ExprState *State) {
     case EEOP_BOOL_AND_STEP_FIRST:
     case EEOP_BOOL_AND_STEP:
     case EEOP_BOOL_AND_STEP_LAST: {
-      todo();
+      x86::Gp Anynull = EmitLoadConstUIntPtr(Jitcc, "op.d.boolexpr.anynull",
+                                             Op->d.boolexpr.anynull);
+      jit::Label L_BoolCheckFalse = Jitcc.newLabel(),
+                 L_BoolCont = Jitcc.newLabel();
+
+      if (Opcode == EEOP_BOOL_AND_STEP_FIRST)
+        EmitStoreToArray(Jitcc, Anynull, 0, jit::imm(0), sizeof(bool));
+
+      x86::Gp OpResvalue = EmitLoadConstUIntPtr(Jitcc, "op.resvalue.uintptr",
+                                                Op->resvalue),
+              OpResnull = EmitLoadConstUIntPtr(Jitcc, "op.resnull.uintptr",
+                                               Op->resnull);
+      x86::Gp Boolvalue = Jitcc.newUIntPtr("resvalue.uintptr"),
+              Boolnull = Jitcc.newInt8("resnull.i8");
+
+      EmitLoadFromArray(Jitcc, OpResvalue, 0, Boolvalue, sizeof(Datum));
+      EmitLoadFromArray(Jitcc, OpResnull, 0, Boolnull, sizeof(bool));
+
+      /* check if current input is NULL */
+      Jitcc.cmp(Boolnull, jit::imm(1));
+      Jitcc.jne(L_BoolCheckFalse);
+      {
+        /* b_boolisnull */
+        /* set boolanynull to true */
+        EmitStoreToArray(Jitcc, Anynull, 0, jit::imm(1), sizeof(bool));
+        Jitcc.jmp(L_BoolCont);
+      }
+
+      Jitcc.bind(L_BoolCheckFalse);
+      {
+        Jitcc.cmp(Boolvalue, jit::imm(0));
+        Jitcc.jne(L_BoolCont);
+
+        /* b_boolisfalse */
+        /* result is already set to FALSE, need not change it */
+        /* and jump to the end of the AND expression */
+        Jitcc.jmp(L_Opblocks[Op->d.boolexpr.jumpdone]);
+      }
+
+      Jitcc.bind(L_BoolCont);
+      {
+        x86::Gp BoolAnyNull = Jitcc.newInt8("boolanynull.i8");
+        EmitLoadFromArray(Jitcc, Anynull, 0, BoolAnyNull, sizeof(bool));
+        Jitcc.cmp(BoolAnyNull, jit::imm(0));
+        Jitcc.je(L_Opblocks[OpIndex + 1]);
+      }
+
+      /* set resnull to true */
+      EmitStoreToArray(Jitcc, OpResnull, 0, jit::imm(1), sizeof(bool));
+      /* reset resvalue */
+      EmitStoreToArray(Jitcc, OpResvalue, 0, jit::imm(0), sizeof(Datum));
+
+      break;
     }
       /*
        * Treat them the same for now, optimizer can remove
@@ -507,11 +560,73 @@ bool AsmJitCompileExpr(ExprState *State) {
     case EEOP_BOOL_OR_STEP_FIRST:
     case EEOP_BOOL_OR_STEP:
     case EEOP_BOOL_OR_STEP_LAST: {
-      todo();
+      x86::Gp Anynull = EmitLoadConstUIntPtr(Jitcc, "op.d.boolexpr.anynull",
+                                             Op->d.boolexpr.anynull);
+      jit::Label L_BoolCheckTrue = Jitcc.newLabel(),
+                 L_BoolCont = Jitcc.newLabel();
+
+      if (Opcode == EEOP_BOOL_OR_STEP_FIRST)
+        EmitStoreToArray(Jitcc, Anynull, 0, jit::imm(0), sizeof(bool));
+
+      x86::Gp OpResvalue = EmitLoadConstUIntPtr(Jitcc, "op.resvalue.uintptr",
+                                                Op->resvalue),
+              OpResnull = EmitLoadConstUIntPtr(Jitcc, "op.resnull.uintptr",
+                                               Op->resnull);
+      x86::Gp Boolvalue = Jitcc.newUIntPtr("resvalue.uintptr"),
+              Boolnull = Jitcc.newInt8("resnull.i8");
+
+      EmitLoadFromArray(Jitcc, OpResvalue, 0, Boolvalue, sizeof(Datum));
+      EmitLoadFromArray(Jitcc, OpResnull, 0, Boolnull, sizeof(bool));
+
+      /* check if current input is NULL */
+      Jitcc.cmp(Boolnull, jit::imm(1));
+      Jitcc.jne(L_BoolCheckTrue);
+      {
+        /* b_boolisnull */
+        /* set boolanynull to true */
+        EmitStoreToArray(Jitcc, Anynull, 0, jit::imm(1), sizeof(bool));
+        Jitcc.jmp(L_BoolCont);
+      }
+
+      Jitcc.bind(L_BoolCheckTrue);
+      {
+        Jitcc.cmp(Boolvalue, jit::imm(1));
+        Jitcc.jne(L_BoolCont);
+
+        /* b_boolistrue */
+        /* result is already set to FALSE, need not change it */
+        /* and jump to the end of the AND expression */
+        Jitcc.jmp(L_Opblocks[Op->d.boolexpr.jumpdone]);
+      }
+
+      Jitcc.bind(L_BoolCont);
+      {
+        x86::Gp BoolAnyNull = Jitcc.newInt8("boolanynull.i8");
+        EmitLoadFromArray(Jitcc, Anynull, 0, BoolAnyNull, sizeof(bool));
+        Jitcc.cmp(BoolAnyNull, jit::imm(0));
+        Jitcc.je(L_Opblocks[OpIndex + 1]);
+      }
+
+      /* set resnull to true */
+      EmitStoreToArray(Jitcc, OpResnull, 0, jit::imm(1), sizeof(bool));
+      /* reset resvalue */
+      EmitStoreToArray(Jitcc, OpResvalue, 0, jit::imm(0), sizeof(Datum));
+      break;
     }
 
     case EEOP_BOOL_NOT_STEP: {
-      todo();
+      x86::Gp OpResvalue =
+          EmitLoadConstUIntPtr(Jitcc, "op.resvalue.uintptr", Op->resvalue);
+      x86::Gp Boolvalue = Jitcc.newUIntPtr("resvalue.uintptr"),
+              NegBool = Jitcc.newUIntPtr("negbool.uintptr");
+
+      EmitLoadFromArray(Jitcc, OpResvalue, 0, Boolvalue, sizeof(Datum));
+      Jitcc.xor_(NegBool, NegBool);
+      Jitcc.cmp(Boolvalue, jit::imm(0));
+      Jitcc.sete(NegBool);
+
+      EmitStoreToArray(Jitcc, OpResvalue, 0, NegBool, sizeof(Datum));
+      break;
     }
 
     case EEOP_QUAL: {
