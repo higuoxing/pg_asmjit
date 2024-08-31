@@ -663,19 +663,56 @@ bool AsmJitCompileExpr(ExprState *State) {
     }
 
     case EEOP_JUMP: {
-      todo();
+      Jitcc.jmp(L_Opblocks[Op->d.jump.jumpdone]);
+      break;
     }
 
     case EEOP_JUMP_IF_NULL: {
-      todo();
+      /* Transfer control if current result is null */
+      x86::Gp OpResnull =
+          EmitLoadConstUIntPtr(Jitcc, "op.resnull.uintptr", Op->resnull);
+      x86::Gp Resnull = Jitcc.newInt8("resnull.i8");
+
+      EmitLoadFromArray(Jitcc, OpResnull, 0, Resnull, sizeof(bool));
+
+      Jitcc.cmp(Resnull, jit::imm(1));
+      Jitcc.je(L_Opblocks[Op->d.jump.jumpdone]);
+
+      break;
     }
 
     case EEOP_JUMP_IF_NOT_NULL: {
-      todo();
+      /* Transfer control if current result is non-null */
+      x86::Gp OpResnull =
+          EmitLoadConstUIntPtr(Jitcc, "op.resnull.uintptr", Op->resnull);
+      x86::Gp Resnull = Jitcc.newInt8("resnull.i8");
+
+      EmitLoadFromArray(Jitcc, OpResnull, 0, Resnull, sizeof(bool));
+
+      Jitcc.cmp(Resnull, jit::imm(0));
+      Jitcc.je(L_Opblocks[Op->d.jump.jumpdone]);
+
+      break;
     }
 
     case EEOP_JUMP_IF_NOT_TRUE: {
-      todo();
+      x86::Gp OpResvalue = EmitLoadConstUIntPtr(Jitcc, "op.resvalue.uintptr",
+                                                Op->resvalue),
+              OpResnull = EmitLoadConstUIntPtr(Jitcc, "op.resnull.uintptr",
+                                               Op->resnull);
+      x86::Gp Resvalue = Jitcc.newUIntPtr("resvalue.uintptr"),
+              Resnull = Jitcc.newInt8("resnull.i8");
+
+      EmitLoadFromArray(Jitcc, OpResvalue, 0, Resvalue, sizeof(Datum));
+      EmitLoadFromArray(Jitcc, OpResnull, 0, Resnull, sizeof(bool));
+
+      /* Transfer control if current result is null or false */
+      Jitcc.cmp(Resnull, jit::imm(1));
+      Jitcc.je(L_Opblocks[Op->d.jump.jumpdone]);
+      Jitcc.cmp(Resvalue, jit::imm(0));
+      Jitcc.je(L_Opblocks[Op->d.jump.jumpdone]);
+
+      break;
     }
 
     case EEOP_NULLTEST_ISNULL: {

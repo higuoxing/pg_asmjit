@@ -1,5 +1,4 @@
 MODULE_big = asmjit
-EXTENSION = asmjit
 PROJ_ROOT_DIR := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 
 ASMJIT_SRCS = $(wildcard $(PROJ_ROOT_DIR)/deps/asmjit/src/*/*/*.cpp)
