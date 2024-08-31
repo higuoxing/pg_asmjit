@@ -111,10 +111,10 @@ static inline void EmitLoadFromFlexibleArray(jit::x86::Compiler &cc,
 }
 
 template <typename T>
-static inline void
-EmitStoreToFlexibleArray(jit::x86::Compiler &cc, jit::x86::Gp &ObjectAddr,
-                         size_t ArrayOff, size_t Index, jit::x86::Gp &Elem,
-                         size_t ElemSize) {
+static inline void EmitStoreToFlexibleArray(jit::x86::Compiler &cc,
+                                            jit::x86::Gp &ObjectAddr,
+                                            size_t ArrayOff, size_t Index,
+                                            const T &Elem, size_t ElemSize) {
   jit::x86::Mem ElemPtr =
       jit::x86::ptr(ObjectAddr, ArrayOff + Index * ElemSize, ElemSize);
   cc.mov(ElemPtr, Elem);
