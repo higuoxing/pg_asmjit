@@ -825,13 +825,27 @@ bool AsmJitCompileExpr(ExprState *State) {
     }
 
     case EEOP_SBSREF_SUBSCRIPTS: {
-      todo();
+      jit::InvokeNode *InvokeSubscriptFunc;
+      x86::Gp RetVal = Jitcc.newInt8("ret.i8");
+      Jitcc.invoke(
+          &InvokeSubscriptFunc, jit::imm(Op->d.sbsref_subscript.subscriptfunc),
+          jit::FuncSignature::build<bool, ExprState *, struct ExprEvalStep *,
+                                    ExprContext *>());
+      InvokeSubscriptFunc->setArg(0, Expression);
+      InvokeSubscriptFunc->setArg(1, jit::imm(Op));
+      InvokeSubscriptFunc->setArg(2, EContext);
+      InvokeSubscriptFunc->setRet(0, RetVal);
+
+      Jitcc.cmp(RetVal, jit::imm(0));
+      Jitcc.je(L_Opblocks[Op->d.sbsref_subscript.jumpdone]);
+      break;
     }
 
     case EEOP_SBSREF_OLD:
     case EEOP_SBSREF_ASSIGN:
     case EEOP_SBSREF_FETCH: {
-      todo();
+      BuildEvalXFunc3(Op->d.sbsref.subscriptfunc);
+      break;
     }
 
     case EEOP_CASE_TESTVAL: {
