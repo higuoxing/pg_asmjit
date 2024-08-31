@@ -860,7 +860,8 @@ bool AsmJitCompileExpr(ExprState *State) {
     }
 
     case EEOP_IOCOERCE_SAFE: {
-      todo();
+      BuildEvalXFunc2(ExecEvalCoerceViaIOSafe);
+      break;
     }
 
     case EEOP_DISTINCT:
@@ -975,11 +976,13 @@ bool AsmJitCompileExpr(ExprState *State) {
     }
 
     case EEOP_JSON_CONSTRUCTOR: {
-      todo();
+      BuildEvalXFunc3(ExecEvalJsonConstructor);
+      break;
     }
 
     case EEOP_IS_JSON: {
-      todo();
+      BuildEvalXFunc2(ExecEvalJsonIsPredicate);
+      break;
     }
 
     case EEOP_JSONEXPR_PATH: {
@@ -987,10 +990,12 @@ bool AsmJitCompileExpr(ExprState *State) {
     }
 
     case EEOP_JSONEXPR_COERCION: {
-      todo();
+      BuildEvalXFunc3(ExecEvalJsonCoercion);
+      break;
     }
     case EEOP_JSONEXPR_COERCION_FINISH: {
-      todo();
+      BuildEvalXFunc2(ExecEvalJsonCoercionFinish);
+      break;
     }
 
     case EEOP_AGGREF: {
@@ -1007,7 +1012,8 @@ bool AsmJitCompileExpr(ExprState *State) {
     }
 
     case EEOP_MERGE_SUPPORT_FUNC: {
-      todo();
+      BuildEvalXFunc3(ExecEvalMergeSupportFunc);
+      break;
     }
 
     case EEOP_SUBPLAN: {
