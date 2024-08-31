@@ -805,19 +805,23 @@ bool AsmJitCompileExpr(ExprState *State) {
     }
 
     case EEOP_PARAM_EXEC: {
-      todo();
+      BuildEvalXFunc3(ExecEvalParamExec);
+      break;
     }
 
     case EEOP_PARAM_EXTERN: {
-      todo();
+      BuildEvalXFunc3(ExecEvalParamExtern);
+      break;
     }
 
     case EEOP_PARAM_CALLBACK: {
-      todo();
+      BuildEvalXFunc3(Op->d.cparam.paramfunc);
+      break;
     }
 
     case EEOP_PARAM_SET: {
-      todo();
+      BuildEvalXFunc3(ExecEvalParamSet);
+      break;
     }
 
     case EEOP_SBSREF_SUBSCRIPTS: {
