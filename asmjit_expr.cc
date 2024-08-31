@@ -1,6 +1,4 @@
-#include "asmjit/x86/x86compiler.h"
 #include "asmjit_common.h"
-#include "executor/execExpr.h"
 
 namespace jit = asmjit;
 namespace x86 = asmjit::x86;
@@ -716,26 +714,94 @@ bool AsmJitCompileExpr(ExprState *State) {
     }
 
     case EEOP_NULLTEST_ISNULL: {
-      todo();
+      x86::Gp OpResvalue = EmitLoadConstUIntPtr(Jitcc, "op.resvalue.uintptr",
+                                                Op->resvalue),
+              OpResnull = EmitLoadConstUIntPtr(Jitcc, "op.resnull.uintptr",
+                                               Op->resnull);
+      x86::Gp Resvalue = Jitcc.newUIntPtr("resvalue.uintptr"),
+              Resnull = Jitcc.newInt8("resnull.i8");
+
+      EmitLoadFromArray(Jitcc, OpResnull, 0, Resnull, sizeof(bool));
+      Jitcc.xor_(Resvalue, Resvalue);
+      Jitcc.cmp(Resnull, jit::imm(1));
+      Jitcc.sete(Resvalue);
+      EmitStoreToArray(Jitcc, OpResvalue, 0, Resvalue, sizeof(Datum));
+      EmitStoreToArray(Jitcc, OpResnull, 0, jit::imm(0), sizeof(bool));
+
+      break;
     }
 
     case EEOP_NULLTEST_ISNOTNULL: {
-      todo();
+      x86::Gp OpResvalue = EmitLoadConstUIntPtr(Jitcc, "op.resvalue.uintptr",
+                                                Op->resvalue),
+              OpResnull = EmitLoadConstUIntPtr(Jitcc, "op.resnull.uintptr",
+                                               Op->resnull);
+      x86::Gp Resvalue = Jitcc.newUIntPtr("resvalue.uintptr"),
+              Resnull = Jitcc.newInt8("resnull.i8");
+
+      EmitLoadFromArray(Jitcc, OpResnull, 0, Resnull, sizeof(bool));
+      Jitcc.xor_(Resvalue, Resvalue);
+      Jitcc.cmp(Resnull, jit::imm(0));
+      Jitcc.sete(Resvalue);
+
+      EmitStoreToArray(Jitcc, OpResvalue, 0, Resvalue, sizeof(Datum));
+      EmitStoreToArray(Jitcc, OpResnull, 0, jit::imm(0), sizeof(bool));
+
+      break;
     }
 
     case EEOP_NULLTEST_ROWISNULL: {
-      todo();
+      BuildEvalXFunc3(ExecEvalRowNull);
+      break;
     }
 
     case EEOP_NULLTEST_ROWISNOTNULL: {
-      todo();
+      BuildEvalXFunc3(ExecEvalRowNotNull);
+      break;
     }
 
     case EEOP_BOOLTEST_IS_TRUE:
     case EEOP_BOOLTEST_IS_NOT_FALSE:
     case EEOP_BOOLTEST_IS_FALSE:
     case EEOP_BOOLTEST_IS_NOT_TRUE: {
-      todo();
+      jit::Label L_NotNull = Jitcc.newLabel();
+      x86::Gp OpResvalue = EmitLoadConstUIntPtr(Jitcc, "op.resvalue.uintptr",
+                                                Op->resvalue),
+              OpResnull = EmitLoadConstUIntPtr(Jitcc, "op.resnull.uintptr",
+                                               Op->resnull);
+      x86::Gp Resnull = Jitcc.newInt8("resnull.i8");
+
+      EmitLoadFromArray(Jitcc, OpResnull, 0, Resnull, sizeof(bool));
+      Jitcc.cmp(Resnull, jit::imm(1));
+      Jitcc.jne(L_NotNull);
+      /* result is not null. */
+      EmitStoreToArray(Jitcc, OpResnull, 0, jit::imm(0), sizeof(bool));
+      EmitStoreToArray(
+          Jitcc, OpResvalue, 0,
+          (Opcode == EEOP_BOOLTEST_IS_TRUE || Opcode == EEOP_BOOLTEST_IS_FALSE)
+              ? jit::imm(0)
+              : jit::imm(1),
+          sizeof(Datum));
+      Jitcc.jmp(L_Opblocks[OpIndex + 1]);
+
+      Jitcc.bind(L_NotNull);
+      if (Opcode == EEOP_BOOLTEST_IS_TRUE ||
+          Opcode == EEOP_BOOLTEST_IS_NOT_FALSE) {
+        /*
+         * if value is not null NULL, return value (already
+         * set)
+         */
+      } else {
+        x86::Gp Resvalue = Jitcc.newUIntPtr("resvalue.uintptr");
+        x86::Gp ResvalueIsFalse = Jitcc.newUIntPtr("resvalueisfalse.uintptr");
+        EmitLoadFromArray(Jitcc, OpResvalue, 0, Resvalue, sizeof(Datum));
+        Jitcc.xor_(ResvalueIsFalse, ResvalueIsFalse);
+        Jitcc.cmp(Resvalue, jit::imm(0));
+        Jitcc.sete(ResvalueIsFalse);
+        EmitStoreToArray(Jitcc, OpResvalue, 0, ResvalueIsFalse, sizeof(Datum));
+      }
+
+      break;
     }
 
     case EEOP_PARAM_EXEC: {
