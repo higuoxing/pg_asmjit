@@ -849,7 +849,34 @@ bool AsmJitCompileExpr(ExprState *State) {
     }
 
     case EEOP_CASE_TESTVAL: {
-      todo();
+      x86::Gp OpResvalue = EmitLoadConstUIntPtr(Jitcc, "op.resvalue.uintptr",
+                                                Op->resvalue),
+              OpResnull = EmitLoadConstUIntPtr(Jitcc, "op.resnull.uintptr",
+                                               Op->resnull);
+      if (Op->d.casetest.value) {
+        x86::Gp CaseValuep =
+                    EmitLoadConstUIntPtr(Jitcc, "op.d.casetest.valuep.uintptr",
+                                         Op->d.casetest.value),
+                CaseNullp =
+                    EmitLoadConstUIntPtr(Jitcc, "op.d.casetest.isnullp.uintptr",
+                                         Op->d.casetest.isnull);
+        x86::Gp CaseValue = Jitcc.newUIntPtr("op.d.casetest.value.uintptr"),
+                CaseNull = Jitcc.newInt8("op.d.casetest.isnull.i8");
+        EmitLoadFromArray(Jitcc, CaseValuep, 0, CaseValue, sizeof(Datum));
+        EmitLoadFromArray(Jitcc, CaseNullp, 0, CaseNull, sizeof(bool));
+
+        EmitStoreToArray(Jitcc, OpResvalue, 0, CaseValue, sizeof(Datum));
+        EmitStoreToArray(Jitcc, OpResnull, 0, CaseNull, sizeof(bool));
+      } else {
+        x86::Gp CaseValue =
+            emit_load_caseValue_datum_from_ExprContext(Jitcc, EContext);
+        x86::Gp CaseNull =
+            emit_load_caseValue_isNull_from_ExprContext(Jitcc, EContext);
+
+        EmitStoreToArray(Jitcc, OpResvalue, 0, CaseValue, sizeof(Datum));
+        EmitStoreToArray(Jitcc, OpResnull, 0, CaseNull, sizeof(bool));
+      }
+      break;
     }
     case EEOP_MAKE_READONLY: {
       todo();
@@ -932,7 +959,34 @@ bool AsmJitCompileExpr(ExprState *State) {
     }
 
     case EEOP_DOMAIN_TESTVAL: {
-      todo();
+      x86::Gp OpResvalue = EmitLoadConstUIntPtr(Jitcc, "op.resvalue.uintptr",
+                                                Op->resvalue),
+              OpResnull = EmitLoadConstUIntPtr(Jitcc, "op.resnull.uintptr",
+                                               Op->resnull);
+      if (Op->d.casetest.value) {
+        x86::Gp CaseValuep =
+                    EmitLoadConstUIntPtr(Jitcc, "op.d.casetest.valuep.uintptr",
+                                         Op->d.casetest.value),
+                CaseNullp =
+                    EmitLoadConstUIntPtr(Jitcc, "op.d.casetest.isnullp.uintptr",
+                                         Op->d.casetest.isnull);
+        x86::Gp CaseValue = Jitcc.newUIntPtr("op.d.casetest.value.uintptr"),
+                CaseNull = Jitcc.newInt8("op.d.casetest.isnull.i8");
+        EmitLoadFromArray(Jitcc, CaseValuep, 0, CaseValue, sizeof(Datum));
+        EmitLoadFromArray(Jitcc, CaseNullp, 0, CaseNull, sizeof(bool));
+
+        EmitStoreToArray(Jitcc, OpResvalue, 0, CaseValue, sizeof(Datum));
+        EmitStoreToArray(Jitcc, OpResnull, 0, CaseNull, sizeof(bool));
+      } else {
+        x86::Gp CaseValue =
+            emit_load_domainValue_datum_from_ExprContext(Jitcc, EContext);
+        x86::Gp CaseNull =
+            emit_load_domainValue_isNull_from_ExprContext(Jitcc, EContext);
+
+        EmitStoreToArray(Jitcc, OpResvalue, 0, CaseValue, sizeof(Datum));
+        EmitStoreToArray(Jitcc, OpResnull, 0, CaseNull, sizeof(bool));
+      }
+      break;
     }
 
     case EEOP_DOMAIN_NOTNULL: {
