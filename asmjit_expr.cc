@@ -879,7 +879,38 @@ bool AsmJitCompileExpr(ExprState *State) {
       break;
     }
     case EEOP_MAKE_READONLY: {
-      todo();
+      x86::Gp Nullp =
+          EmitLoadConstUIntPtr(Jitcc, "op.d.make_readonly.isnullp.uintptr",
+                               Op->d.make_readonly.isnull);
+      x86::Gp Null = Jitcc.newInt8("op.d.make_readonly.isnull.i8");
+
+      EmitLoadFromArray(Jitcc, Nullp, 0, Null, sizeof(bool));
+
+      /* store null isnull value in result */
+      x86::Gp OpResnull =
+          EmitLoadConstUIntPtr(Jitcc, "op.resnull.uintptr", Op->resnull);
+      EmitStoreToArray(Jitcc, OpResnull, 0, Null, sizeof(bool));
+
+      Jitcc.cmp(Null, jit::imm(1));
+      Jitcc.je(L_Opblocks[OpIndex + 1]);
+
+      /* if value is not null, convert to RO datum */
+      x86::Gp Valuep =
+          EmitLoadConstUIntPtr(Jitcc, "op.d.make_readonly.valuep.uintptr",
+                               Op->d.make_readonly.value);
+      x86::Gp Value = Jitcc.newUIntPtr("op.d.make_readonly.value.uintptr");
+      EmitLoadFromArray(Jitcc, Valuep, 0, Value, sizeof(Datum));
+      jit::InvokeNode *InvokeMakeExpandedObjectReadOnly;
+      Jitcc.invoke(&InvokeMakeExpandedObjectReadOnly,
+                   jit::imm(MakeExpandedObjectReadOnlyInternal),
+                   jit::FuncSignature::build<Datum, Datum>());
+      InvokeMakeExpandedObjectReadOnly->setArg(0, Value);
+      InvokeMakeExpandedObjectReadOnly->setRet(0, Value);
+
+      x86::Gp OpResvalue =
+          EmitLoadConstUIntPtr(Jitcc, "op.resvalue.uintptr", Op->resvalue);
+      EmitStoreToArray(Jitcc, OpResvalue, 0, Value, sizeof(Datum));
+      break;
     }
 
     case EEOP_IOCOERCE: {
