@@ -120,4 +120,27 @@ static inline void EmitStoreToFlexibleArray(jit::x86::Compiler &cc,
   cc.mov(ElemPtr, Elem);
 }
 
+static inline jit::x86::Gp
+LoadFuncArgNull(jit::x86::Compiler &cc, jit::x86::Gp &v_fcinfo, size_t argno) {
+  jit::x86::Gp v_argnull = cc.newInt8("v_argnull.i8");
+  EmitLoadFromFlexibleArray(cc, v_fcinfo,
+                            offsetof(FunctionCallInfoBaseData, args) +
+                                argno * sizeof(NullableDatum) +
+                                offsetof(NullableDatum, isnull),
+                            0, v_argnull, sizeof(bool));
+  return v_argnull;
+}
+
+static inline jit::x86::Gp LoadFuncArgValue(jit::x86::Compiler &cc,
+                                            jit::x86::Gp &v_funcinfo,
+                                            size_t argno) {
+  jit::x86::Gp v_argvalue = cc.newUIntPtr("v_argvalue.uintptr");
+  EmitLoadFromFlexibleArray(cc, v_funcinfo,
+                            offsetof(FunctionCallInfoBaseData, args) +
+                                argno * sizeof(NullableDatum) +
+                                offsetof(NullableDatum, value),
+                            0, v_argvalue, sizeof(Datum));
+  return v_argvalue;
+}
+
 #endif

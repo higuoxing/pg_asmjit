@@ -411,7 +411,7 @@ bool AsmJitCompileExpr(ExprState *State) {
     case EEOP_FUNCEXPR:
     case EEOP_FUNCEXPR_STRICT: {
       FunctionCallInfo FuncCallInfo = Op->d.func.fcinfo_data;
-      x86::Gp FuncCallInfoAddr =
+      x86::Gp v_fcinfo =
           EmitLoadConstUIntPtr(Jitcc, "func.fcinfo_data", FuncCallInfo);
 
       jit::Label L_InvokePGFunc = Jitcc.newLabel();
@@ -427,14 +427,8 @@ bool AsmJitCompileExpr(ExprState *State) {
 
         /* Check for NULL args for strict function. */
         for (int ArgIndex = 0; ArgIndex < ArgsNum; ++ArgIndex) {
-          x86::Mem FuncCallInfoArgNIsNullPtr =
-              x86::ptr(FuncCallInfoAddr,
-                       offsetof(FunctionCallInfoBaseData, args) +
-                           ArgIndex * sizeof(NullableDatum) +
-                           offsetof(NullableDatum, isnull),
-                       sizeof(bool));
-          x86::Gp FuncCallInfoArgNIsNull = Jitcc.newInt8();
-          Jitcc.mov(FuncCallInfoArgNIsNull, FuncCallInfoArgNIsNullPtr);
+          x86::Gp FuncCallInfoArgNIsNull =
+              LoadFuncArgNull(Jitcc, v_fcinfo, ArgIndex);
           Jitcc.cmp(FuncCallInfoArgNIsNull, jit::imm(1));
           Jitcc.je(L_StrictFail);
         }
@@ -453,10 +447,8 @@ bool AsmJitCompileExpr(ExprState *State) {
        * Before invoking PGFuncs, we should set FuncCallInfo->isnull to false.
        */
       Jitcc.bind(L_InvokePGFunc);
-      x86::Mem FuncCallInfoIsNullPtr =
-          x86::ptr(FuncCallInfoAddr, offsetof(FunctionCallInfoBaseData, isnull),
-                   sizeof(bool));
-      Jitcc.mov(FuncCallInfoIsNullPtr, jit::imm(0));
+      emit_store_isnull_to_FunctionCallInfoBaseData(Jitcc, v_fcinfo,
+                                                    jit::imm(0));
 
       jit::InvokeNode *PGFunc;
       x86::Gp RetValue = Jitcc.newUIntPtr();
@@ -472,8 +464,8 @@ bool AsmJitCompileExpr(ExprState *State) {
                                                Op->resnull);
 
       EmitStoreToArray(Jitcc, OpResValue, 0, RetValue, sizeof(Datum));
-      x86::Gp FuncCallInfoIsNull = Jitcc.newInt8();
-      Jitcc.mov(FuncCallInfoIsNull, FuncCallInfoIsNullPtr);
+      x86::Gp FuncCallInfoIsNull =
+          emit_load_isnull_from_FunctionCallInfoBaseData(Jitcc, v_fcinfo);
       EmitStoreToArray(Jitcc, OpResNull, 0, FuncCallInfoIsNull, sizeof(bool));
 
       break;
@@ -1031,13 +1023,152 @@ bool AsmJitCompileExpr(ExprState *State) {
     }
 
     case EEOP_HASHDATUM_SET_INITVAL: {
-      todo();
+      x86::Gp OpResValue = EmitLoadConstUIntPtr(Jitcc, "op.resvalue.uintptr",
+                                                Op->resvalue),
+              OpResNull = EmitLoadConstUIntPtr(Jitcc, "op.resnull.uintptr",
+                                               Op->resnull);
+      EmitStoreToArray(Jitcc, OpResValue, 0,
+                       jit::imm(Op->d.hashdatum_initvalue.init_value),
+                       sizeof(Datum));
+      EmitStoreToArray(Jitcc, OpResNull, 0, jit::imm(0), sizeof(bool));
+
+      break;
     }
     case EEOP_HASHDATUM_FIRST:
     case EEOP_HASHDATUM_FIRST_STRICT:
     case EEOP_HASHDATUM_NEXT32:
     case EEOP_HASHDATUM_NEXT32_STRICT: {
-      todo();
+      jit::Label L_IfNull = Jitcc.newLabel();
+      FunctionCallInfo fcinfo = Op->d.hashdatum.fcinfo_data;
+      x86::Gp v_prevhash = Jitcc.newUIntPtr("prevhash.uintptr");
+      /*
+       * When performing the next hash and not in strict mode we
+       * perform a rotation of the previously stored hash value
+       * before doing the NULL check.  We want to do this even
+       * when we receive a NULL Datum to hash.  In strict mode,
+       * we do this after the NULL check so as not to waste the
+       * effort of rotating the bits when we're going to throw
+       * away the hash value and return NULL.
+       */
+      if (Opcode == EEOP_HASHDATUM_NEXT32) {
+        /*
+         * Fetch the previously hashed value from where the
+         * EEOP_HASHDATUM_FIRST operation stored it.
+         */
+        x86::Gp v_resvaluep =
+            EmitLoadConstUIntPtr(Jitcc, "op.resvalue.uintptr", Op->resvalue);
+        EmitLoadFromArray(Jitcc, v_resvaluep, 0, v_prevhash, sizeof(Datum));
+
+        /*
+         * Rotate bits left by 1 bit.  Be careful not to
+         * overflow uint32 when working with size_t.
+         */
+        x86::Gp v_tmp = Jitcc.newUInt64("tmp.u64");
+        Jitcc.mov(v_tmp, v_prevhash);
+        Jitcc.shl(v_tmp, jit::imm(1));
+        Jitcc.and_(v_tmp, jit::imm(0xffffffff));
+        Jitcc.shr(v_prevhash, jit::imm(31));
+        Jitcc.or_(v_prevhash, v_tmp);
+      }
+
+      /* We expect the hash function to have 1 argument */
+      if (fcinfo->nargs != 1)
+        ereport(ERROR, (errmsg("incorrect number of function arguments")));
+
+      x86::Gp v_fcinfo = EmitLoadConstUIntPtr(Jitcc, "fcinfo.uintptr", fcinfo);
+      /* emit code to check if the input parameter is NULL */
+      x86::Gp v_argisnull = LoadFuncArgNull(Jitcc, v_fcinfo, 0);
+      Jitcc.cmp(v_argisnull, jit::imm(1));
+      Jitcc.je(L_IfNull);
+      {
+        /* If not null. */
+        /*
+         * Rotate the previously stored hash value when performing
+         * NEXT32 in strict mode.  In non-strict mode we already
+         * did this before checking for NULLs.
+         */
+        if (Opcode == EEOP_HASHDATUM_NEXT32_STRICT) {
+          /*
+           * Fetch the previously hashed value from where the
+           * EEOP_HASHDATUM_FIRST_STRICT operation stored it.
+           */
+          x86::Gp v_resvaluep =
+              EmitLoadConstUIntPtr(Jitcc, "op.resvalue.uintptr", Op->resvalue);
+          EmitLoadFromArray(Jitcc, v_resvaluep, 0, v_prevhash, sizeof(Datum));
+
+          /*
+           * Rotate bits left by 1 bit.  Be careful not to
+           * overflow uint32 when working with size_t.
+           */
+          x86::Gp v_tmp = Jitcc.newUInt64("v_tmp.u64");
+          Jitcc.mov(v_tmp, v_prevhash);
+          Jitcc.shl(v_tmp, jit::imm(1));
+          Jitcc.and_(v_tmp, jit::imm(0xffffffff));
+          Jitcc.shr(v_prevhash, jit::imm(31));
+          Jitcc.or_(v_prevhash, v_tmp);
+        }
+
+        /* call the hash function */
+        x86::Gp v_retval = Jitcc.newUInt64("v_retval.u64");
+        jit::InvokeNode *PGFunc;
+        Jitcc.invoke(&PGFunc, jit::imm(fcinfo->flinfo->fn_addr),
+                     jit::FuncSignature::build<Datum, FunctionCallInfo>());
+        PGFunc->setArg(0, v_fcinfo);
+        PGFunc->setRet(0, v_retval);
+        /*
+         * For NEXT32 ops, XOR (^) the returned hash value with
+         * the existing hash value.
+         */
+        if (Opcode == EEOP_HASHDATUM_NEXT32 ||
+            Opcode == EEOP_HASHDATUM_NEXT32_STRICT)
+          Jitcc.xor_(v_retval, v_prevhash);
+
+        x86::Gp v_resvaluep = EmitLoadConstUIntPtr(Jitcc, "op.resvalue.uintptr",
+                                                   Op->resvalue),
+                v_resnullp = EmitLoadConstUIntPtr(Jitcc, "op.resnull.uintptr",
+                                                  Op->resnull);
+        EmitStoreToArray(Jitcc, v_resvaluep, 0, v_retval, sizeof(Datum));
+        EmitStoreToArray(Jitcc, v_resnullp, 0, jit::imm(0), sizeof(bool));
+
+        Jitcc.jmp(L_Opblocks[OpIndex + 1]);
+      }
+
+      Jitcc.bind(L_IfNull);
+      {
+        if (Opcode == EEOP_HASHDATUM_FIRST_STRICT ||
+            Opcode == EEOP_HASHDATUM_NEXT32_STRICT) {
+          /*
+           * In strict node, NULL inputs result in NULL.  Save
+           * the NULL result and goto jumpdone.
+           */
+          x86::Gp v_resvaluep = EmitLoadConstUIntPtr(
+                      Jitcc, "op.resvalue.uintptr", Op->resvalue),
+                  v_resnullp = EmitLoadConstUIntPtr(Jitcc, "op.resnull.uintptr",
+                                                    Op->resnull);
+          EmitStoreToArray(Jitcc, v_resnullp, 0, jit::imm(1), sizeof(bool));
+          EmitStoreToArray(Jitcc, v_resvaluep, 0, jit::imm(0), sizeof(Datum));
+
+          Jitcc.jmp(L_Opblocks[Op->d.hashdatum.jumpdone]);
+        } else {
+          x86::Gp v_resvaluep = EmitLoadConstUIntPtr(
+                      Jitcc, "op.resvalue.uintptr", Op->resvalue),
+                  v_resnullp = EmitLoadConstUIntPtr(Jitcc, "op.resnull.uintptr",
+                                                    Op->resnull);
+          EmitStoreToArray(Jitcc, v_resnullp, 0, jit::imm(0), sizeof(bool));
+
+          if (Opcode == EEOP_HASHDATUM_NEXT32) {
+            /* Assert(v_prevhash != NULL) */
+            EmitStoreToArray(Jitcc, v_resvaluep, 0, v_prevhash, sizeof(Datum));
+          } else {
+            Assert(Opcode == EEOP_HASHDATUM_FIRST);
+            EmitStoreToArray(Jitcc, v_resvaluep, 0, jit::imm(0), sizeof(Datum));
+          }
+
+          Jitcc.jmp(L_Opblocks[OpIndex + 1]);
+        }
+      }
+
+      break;
     }
 
     case EEOP_CONVERT_ROWTYPE: {
