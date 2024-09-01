@@ -1056,7 +1056,68 @@ bool AsmJitCompileExpr(ExprState *State) {
     }
 
     case EEOP_NULLIF: {
-      todo();
+      FunctionCallInfo fcinfo = Op->d.func.fcinfo_data;
+      jit::Label L_NonNull = Jitcc.newLabel(), L_HasNull = Jitcc.newLabel();
+      x86::Gp v_fcinfo =
+          EmitLoadConstUIntPtr(Jitcc, "v_fcinfo.uintptr", fcinfo);
+
+      /* if either argument is NULL they can't be equal */
+      x86::Gp v_argnull0 = LoadFuncArgNull(Jitcc, v_fcinfo, 0);
+      x86::Gp v_argnull1 = LoadFuncArgNull(Jitcc, v_fcinfo, 1);
+      x86::Gp v_anyargisnull = Jitcc.newInt8("v_anyargisnull.i8");
+      Jitcc.mov(v_anyargisnull, v_argnull0);
+      Jitcc.or_(v_anyargisnull, v_argnull1);
+
+      Jitcc.cmp(v_anyargisnull, jit::imm(1));
+      Jitcc.jne(L_NonNull);
+      Jitcc.bind(L_HasNull);
+      {
+        x86::Gp v_arg0 = LoadFuncArgValue(Jitcc, v_fcinfo, 0);
+        x86::Gp v_resnullp =
+            EmitLoadConstUIntPtr(Jitcc, "op.resnullp.uintptr", Op->resnull);
+        x86::Gp v_resvaluep =
+            EmitLoadConstUIntPtr(Jitcc, "op.resvaluep.uintptr", Op->resvalue);
+        EmitStoreToArray(Jitcc, v_resnullp, 0, v_argnull0, sizeof(bool));
+        EmitStoreToArray(Jitcc, v_resvaluep, 0, v_arg0, sizeof(Datum));
+        Jitcc.jmp(L_Opblocks[OpIndex + 1]);
+      }
+
+      Jitcc.bind(L_NonNull);
+      {
+        /* call the hash function */
+        x86::Gp v_retval = Jitcc.newUInt64("v_retval.u64");
+        jit::InvokeNode *PGFunc;
+        Jitcc.invoke(&PGFunc, jit::imm(fcinfo->flinfo->fn_addr),
+                     jit::FuncSignature::build<Datum, FunctionCallInfo>());
+        PGFunc->setArg(0, v_fcinfo);
+        PGFunc->setRet(0, v_retval);
+        x86::Gp v_fcinfo_isnull =
+            emit_load_isnull_from_FunctionCallInfoBaseData(Jitcc, v_fcinfo);
+
+        /*
+         * If result not null, and arguments are equal return null
+         * (same result as if there'd been NULLs, hence reuse
+         * b_hasnull).
+         */
+        x86::Gp v_argsequal = Jitcc.newUInt64("v_argsequal.u64");
+        Jitcc.xor_(v_argsequal, v_argsequal);
+        Jitcc.cmp(v_fcinfo_isnull, jit::imm(0));
+        Jitcc.sete(v_argsequal);
+        Jitcc.and_(v_argsequal, v_retval);
+
+        Jitcc.cmp(v_argsequal, jit::imm(1));
+        Jitcc.jne(L_HasNull);
+
+        /* build block setting result to NULL, if args are equal */
+        x86::Gp v_resnullp =
+            EmitLoadConstUIntPtr(Jitcc, "op.resnullp.uintptr", Op->resnull);
+        x86::Gp v_resvaluep =
+            EmitLoadConstUIntPtr(Jitcc, "op.resvaluep.uintptr", Op->resvalue);
+        EmitStoreToArray(Jitcc, v_resnullp, 0, jit::imm(1), sizeof(bool));
+        EmitStoreToArray(Jitcc, v_resvaluep, 0, jit::imm(0), sizeof(Datum));
+      }
+
+      break;
     }
 
     case EEOP_SQLVALUEFUNCTION: {
