@@ -976,7 +976,83 @@ bool AsmJitCompileExpr(ExprState *State) {
 
     case EEOP_DISTINCT:
     case EEOP_NOT_DISTINCT: {
-      todo();
+      FunctionCallInfo fcinfo = Op->d.func.fcinfo_data;
+      jit::Label L_NoArgIsNull = Jitcc.newLabel(),
+                 L_AnyArgIsNull = Jitcc.newLabel();
+      x86::Gp v_fcinfo =
+          EmitLoadConstUIntPtr(Jitcc, "v_fcinfo.uintptr", fcinfo);
+      /* load args[0|1].isnull for both arguments */
+      x86::Gp v_argnull0 = LoadFuncArgNull(Jitcc, v_fcinfo, 0),
+              v_argnull1 = LoadFuncArgNull(Jitcc, v_fcinfo, 1);
+      x86::Gp v_anyargisnull = Jitcc.newInt8("v_anyargisnull.i8");
+      Jitcc.mov(v_anyargisnull, v_argnull0);
+      Jitcc.or_(v_anyargisnull, v_argnull1);
+
+      Jitcc.cmp(v_anyargisnull, jit::imm(0));
+      Jitcc.je(L_NoArgIsNull);
+      {
+        /* check both arguments */
+        x86::Gp v_bothargisnull = Jitcc.newInt8("v_bothargisnull.i8");
+        Jitcc.mov(v_bothargisnull, v_argnull0);
+        Jitcc.and_(v_bothargisnull, v_argnull1);
+        Jitcc.cmp(v_bothargisnull, jit::imm(1));
+        Jitcc.jne(L_AnyArgIsNull);
+        {
+          x86::Gp v_resnullp =
+              EmitLoadConstUIntPtr(Jitcc, "op.resnullp.uintptr", Op->resnull);
+          x86::Gp v_resvaluep =
+              EmitLoadConstUIntPtr(Jitcc, "op.resvaluep.uintptr", Op->resvalue);
+          EmitStoreToArray(Jitcc, v_resnullp, 0, jit::imm(0), sizeof(bool));
+          if (Opcode == EEOP_NOT_DISTINCT)
+            EmitStoreToArray(Jitcc, v_resvaluep, 0, jit::imm(1), sizeof(Datum));
+          else
+            EmitStoreToArray(Jitcc, v_resvaluep, 0, jit::imm(0), sizeof(Datum));
+          Jitcc.jmp(L_Opblocks[OpIndex + 1]);
+        }
+
+        Jitcc.bind(L_AnyArgIsNull);
+        {
+          x86::Gp v_resnullp =
+              EmitLoadConstUIntPtr(Jitcc, "op.resnullp.uintptr", Op->resnull);
+          x86::Gp v_resvaluep =
+              EmitLoadConstUIntPtr(Jitcc, "op.resvaluep.uintptr", Op->resvalue);
+          EmitStoreToArray(Jitcc, v_resnullp, 0, jit::imm(0), sizeof(bool));
+          if (Opcode == EEOP_NOT_DISTINCT)
+            EmitStoreToArray(Jitcc, v_resvaluep, 0, jit::imm(0), sizeof(Datum));
+          else
+            EmitStoreToArray(Jitcc, v_resvaluep, 0, jit::imm(1), sizeof(Datum));
+          Jitcc.jmp(L_Opblocks[OpIndex + 1]);
+        }
+      }
+
+      Jitcc.bind(L_NoArgIsNull);
+      {
+        /* call the hash function */
+        x86::Gp v_retval = Jitcc.newUInt64("v_retval.u64");
+        jit::InvokeNode *PGFunc;
+        Jitcc.invoke(&PGFunc, jit::imm(fcinfo->flinfo->fn_addr),
+                     jit::FuncSignature::build<Datum, FunctionCallInfo>());
+        PGFunc->setArg(0, v_fcinfo);
+        PGFunc->setRet(0, v_retval);
+        x86::Gp v_fcinfo_isnull =
+            emit_load_isnull_from_FunctionCallInfoBaseData(Jitcc, v_fcinfo);
+        if (Opcode == EEOP_DISTINCT) {
+          /* Must invert the result of "=" */
+          x86::Gp v_tmpretval = Jitcc.newUInt64("v_tmpretval.u64");
+          Jitcc.mov(v_tmpretval, v_retval);
+          Jitcc.xor_(v_retval, v_retval);
+          Jitcc.cmp(v_tmpretval, jit::imm(0));
+          Jitcc.sete(v_retval);
+        }
+        x86::Gp v_resnullp =
+            EmitLoadConstUIntPtr(Jitcc, "op.resnullp.uintptr", Op->resnull);
+        x86::Gp v_resvaluep =
+            EmitLoadConstUIntPtr(Jitcc, "op.resvaluep.uintptr", Op->resvalue);
+
+        EmitStoreToArray(Jitcc, v_resnullp, 0, v_fcinfo_isnull, sizeof(bool));
+        EmitStoreToArray(Jitcc, v_resvaluep, 0, v_retval, sizeof(Datum));
+      }
+      break;
     }
 
     case EEOP_NULLIF: {
