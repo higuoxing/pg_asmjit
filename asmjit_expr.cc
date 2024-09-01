@@ -1027,7 +1027,6 @@ bool AsmJitCompileExpr(ExprState *State) {
 
       Jitcc.bind(L_NoArgIsNull);
       {
-        /* call the hash function */
         x86::Gp v_retval = Jitcc.newUInt64("v_retval.u64");
         jit::InvokeNode *PGFunc;
         Jitcc.invoke(&PGFunc, jit::imm(fcinfo->flinfo->fn_addr),
@@ -1084,7 +1083,6 @@ bool AsmJitCompileExpr(ExprState *State) {
 
       Jitcc.bind(L_NonNull);
       {
-        /* call the hash function */
         x86::Gp v_retval = Jitcc.newUInt64("v_retval.u64");
         jit::InvokeNode *PGFunc;
         Jitcc.invoke(&PGFunc, jit::imm(fcinfo->flinfo->fn_addr),
@@ -1151,11 +1149,93 @@ bool AsmJitCompileExpr(ExprState *State) {
     }
 
     case EEOP_ROWCOMPARE_STEP: {
-      todo();
+      FunctionCallInfo fcinfo = Op->d.rowcompare_step.fcinfo_data;
+      x86::Gp v_fcinfo =
+          EmitLoadConstUIntPtr(Jitcc, "v_fcinfo.uintptr", fcinfo);
+      jit::Label L_Null = Jitcc.newLabel();
+      /*
+       * If function is strict, and either arg is null, we're
+       * done.
+       */
+      if (Op->d.rowcompare_step.finfo->fn_strict) {
+        x86::Gp v_argnull0 = LoadFuncArgNull(Jitcc, v_fcinfo, 0);
+        x86::Gp v_argnull1 = LoadFuncArgNull(Jitcc, v_fcinfo, 1);
+        x86::Gp v_anyargisnull = Jitcc.newInt8("v_anyargisnull.i8");
+        Jitcc.mov(v_anyargisnull, v_argnull0);
+        Jitcc.or_(v_anyargisnull, v_argnull1);
+        Jitcc.cmp(v_anyargisnull, jit::imm(1));
+        Jitcc.je(L_Null);
+      }
+
+      x86::Gp v_retval = Jitcc.newUInt64("v_retval.u64");
+      jit::InvokeNode *PGFunc;
+      Jitcc.invoke(&PGFunc, jit::imm(fcinfo->flinfo->fn_addr),
+                   jit::FuncSignature::build<Datum, FunctionCallInfo>());
+      PGFunc->setArg(0, v_fcinfo);
+      PGFunc->setRet(0, v_retval);
+      x86::Gp v_fcinfo_isnull =
+          emit_load_isnull_from_FunctionCallInfoBaseData(Jitcc, v_fcinfo);
+
+      x86::Gp v_resvaluep =
+          EmitLoadConstUIntPtr(Jitcc, "op.resvaluep.uintptr", Op->resvalue);
+      EmitStoreToArray(Jitcc, v_resvaluep, 0, v_retval, sizeof(Datum));
+      /* if result of function is NULL, force NULL result */
+      Jitcc.cmp(v_fcinfo_isnull, jit::imm(0));
+      Jitcc.jne(L_Null);
+      /* if results equal, compare next, otherwise done */
+      Jitcc.cmp(v_retval, jit::imm(0));
+      Jitcc.je(L_Opblocks[OpIndex + 1]);
+      Jitcc.jmp(L_Opblocks[Op->d.rowcompare_step.jumpdone]);
+
+      Jitcc.bind(L_Null);
+      x86::Gp v_resnullp =
+          EmitLoadConstUIntPtr(Jitcc, "op.resnullp.uintptr", Op->resnull);
+      EmitStoreToArray(Jitcc, v_resnullp, 0, jit::imm(1), sizeof(bool));
+      Jitcc.jmp(L_Opblocks[Op->d.rowcompare_step.jumpnull]);
+      break;
     }
 
     case EEOP_ROWCOMPARE_FINAL: {
-      todo();
+      RowCompareType rctype = Op->d.rowcompare_final.rctype;
+
+      /*
+       * Btree comparators return 32 bit results, need to be
+       * careful about sign (used as a 64 bit value it's
+       * otherwise wrong).
+       */
+      x86::Gp v_resvaluep =
+          EmitLoadConstUIntPtr(Jitcc, "op.resvaluep.uintptr", Op->resvalue);
+      x86::Gp v_resnullp =
+          EmitLoadConstUIntPtr(Jitcc, "op.resnullp.uintptr", Op->resnull);
+      x86::Gp v_cmpop = Jitcc.newInt32("v_cmpop.i32");
+      EmitLoadFromArray(Jitcc, v_resvaluep, 0, v_cmpop, sizeof(int32));
+      x86::Gp v_cmpresult = Jitcc.newUInt64("v_cmpresult.u64");
+      Jitcc.xor_(v_cmpresult, v_cmpresult);
+      Jitcc.cmp(v_cmpop, jit::imm(0));
+
+      switch (rctype) {
+      case ROWCOMPARE_LT:
+        Jitcc.setl(v_cmpresult);
+        break;
+      case ROWCOMPARE_LE:
+        Jitcc.setle(v_cmpresult);
+        break;
+      case ROWCOMPARE_GT:
+        Jitcc.setg(v_cmpresult);
+        break;
+      case ROWCOMPARE_GE:
+        Jitcc.setge(v_cmpresult);
+        break;
+      default:
+        /* EQ and NE cases aren't allowed here */
+        Assert(false);
+        break;
+      }
+
+      EmitStoreToArray(Jitcc, v_resnullp, 0, jit::imm(0), sizeof(bool));
+      EmitStoreToArray(Jitcc, v_resvaluep, 0, v_cmpresult, sizeof(Datum));
+
+      break;
     }
 
     case EEOP_MINMAX: {
