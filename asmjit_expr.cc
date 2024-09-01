@@ -1531,7 +1531,32 @@ bool AsmJitCompileExpr(ExprState *State) {
     }
 
     case EEOP_AGGREF: {
-      todo();
+      /*
+       * Returns a Datum whose value is the precomputed aggregate value
+       * found in the given expression context.
+       */
+      x86::Gp v_aggvaluesp =
+          emit_load_ecxt_aggvalues_from_ExprContext(Jitcc, EContext);
+      x86::Gp v_aggnullsp =
+          emit_load_ecxt_aggnulls_from_ExprContext(Jitcc, EContext);
+      x86::Gp v_value = Jitcc.newUIntPtr("v_value.uintptr");
+      x86::Gp v_isnull = Jitcc.newInt8("v_isnull.i8");
+
+      /* load agg value / null */
+      EmitLoadFromArray(Jitcc, v_aggvaluesp, Op->d.aggref.aggno, v_value,
+                        sizeof(Datum));
+      EmitLoadFromArray(Jitcc, v_aggnullsp, Op->d.aggref.aggno, v_isnull,
+                        sizeof(bool));
+
+      /* and store result */
+      x86::Gp v_resnullp =
+          EmitLoadConstUIntPtr(Jitcc, "op.resnullp.uintptr", Op->resnull);
+      x86::Gp v_resvaluep =
+          EmitLoadConstUIntPtr(Jitcc, "op.resvaluep.uintptr", Op->resvalue);
+      EmitStoreToArray(Jitcc, v_resnullp, 0, v_isnull, sizeof(bool));
+      EmitStoreToArray(Jitcc, v_resvaluep, 0, v_value, sizeof(Datum));
+
+      break;
     }
 
     case EEOP_GROUPING_FUNC: {
@@ -1540,7 +1565,37 @@ bool AsmJitCompileExpr(ExprState *State) {
     }
 
     case EEOP_WINDOW_FUNC: {
-      todo();
+      WindowFuncExprState *wfunc = Op->d.window_func.wfstate;
+      /*
+       * At this point aggref->wfuncno is not yet set (it's set
+       * up in ExecInitWindowAgg() after initializing the
+       * expression). So load it from memory each time round.
+       */
+      x86::Gp v_wfuncnop =
+          EmitLoadConstUIntPtr(Jitcc, "v_wfuncnop.uintptr", &wfunc->wfuncno);
+      x86::Gp v_wfuncno = Jitcc.newInt32("v_wfuncno.i32");
+      EmitLoadFromArray(Jitcc, v_wfuncnop, 0, v_wfuncno, sizeof(int32));
+      x86::Gp v_aggvaluesp =
+          emit_load_ecxt_aggvalues_from_ExprContext(Jitcc, EContext);
+      x86::Gp v_aggnullsp =
+          emit_load_ecxt_aggnulls_from_ExprContext(Jitcc, EContext);
+      x86::Gp v_value = Jitcc.newUIntPtr("v_value.uintptr");
+      x86::Gp v_isnull = Jitcc.newInt8("v_isnull.i8");
+
+      /* load agg value / null */
+      x86::Mem m_aggvaluesp = x86::ptr(v_aggvaluesp, v_wfuncno, 3);
+      x86::Mem m_aggnullsp = x86::ptr(v_aggnullsp, v_wfuncno, 0);
+      Jitcc.mov(v_value, m_aggvaluesp);
+      Jitcc.mov(v_isnull, m_aggnullsp);
+
+      x86::Gp v_resnullp =
+          EmitLoadConstUIntPtr(Jitcc, "op.resnullp.uintptr", Op->resnull);
+      x86::Gp v_resvaluep =
+          EmitLoadConstUIntPtr(Jitcc, "op.resvaluep.uintptr", Op->resvalue);
+      EmitStoreToArray(Jitcc, v_resnullp, 0, v_isnull, sizeof(bool));
+      EmitStoreToArray(Jitcc, v_resvaluep, 0, v_value, sizeof(Datum));
+
+      break;
     }
 
     case EEOP_MERGE_SUPPORT_FUNC: {
