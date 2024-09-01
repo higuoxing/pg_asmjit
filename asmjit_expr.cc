@@ -1,3 +1,5 @@
+#include "asmjit/core/compiler.h"
+#include "asmjit/core/func.h"
 #include "asmjit_common.h"
 
 namespace jit = asmjit;
@@ -1479,7 +1481,44 @@ bool AsmJitCompileExpr(ExprState *State) {
     }
 
     case EEOP_JSONEXPR_PATH: {
-      todo();
+      JsonExprState *jsestate = Op->d.jsonexpr.jsestate;
+      x86::Gp v_ret = Jitcc.newInt32("v_ret.i32");
+      /*
+       * Call ExecEvalJsonExprPath().  It returns the address of
+       * the step to perform next.
+       */
+      jit::InvokeNode *InvokeExecEvalJsonExprPath;
+      Jitcc.invoke(&InvokeExecEvalJsonExprPath, jit::imm(ExecEvalJsonExprPath),
+                   jit::FuncSignature::build<int, ExprState *, ExprEvalStep *,
+                                             ExprContext *>());
+      InvokeExecEvalJsonExprPath->setArg(0, Expression);
+      InvokeExecEvalJsonExprPath->setArg(1, jit::imm(Op));
+      InvokeExecEvalJsonExprPath->setArg(2, EContext);
+      InvokeExecEvalJsonExprPath->setRet(0, v_ret);
+
+      /*
+       * Build a switch to map the return value (v_ret above),
+       * which is a runtime value of the step address to perform
+       * next, to either jump_empty, jump_error,
+       * jump_eval_coercion, or jump_end.
+       */
+      if (jsestate->jump_empty >= 0) {
+        Jitcc.cmp(v_ret, jit::imm(jsestate->jump_empty));
+        Jitcc.je(L_Opblocks[jsestate->jump_empty]);
+      }
+
+      if (jsestate->jump_error >= 0) {
+        Jitcc.cmp(v_ret, jit::imm(jsestate->jump_error));
+        Jitcc.je(L_Opblocks[jsestate->jump_error]);
+      }
+
+      if (jsestate->jump_eval_coercion >= 0) {
+        Jitcc.cmp(v_ret, jit::imm(jsestate->jump_eval_coercion));
+        Jitcc.je(L_Opblocks[jsestate->jump_eval_coercion]);
+      }
+
+      Jitcc.jmp(L_Opblocks[jsestate->jump_end]);
+      break;
     }
 
     case EEOP_JSONEXPR_COERCION: {
