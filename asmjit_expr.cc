@@ -906,7 +906,67 @@ bool AsmJitCompileExpr(ExprState *State) {
     }
 
     case EEOP_IOCOERCE: {
-      todo();
+      FunctionCallInfo fcinfo_out = Op->d.iocoerce.fcinfo_data_out,
+                       fcinfo_in = Op->d.iocoerce.fcinfo_data_in;
+      jit::Label L_SkipOutputCall = Jitcc.newLabel(),
+                 L_InputCall = Jitcc.newLabel();
+
+      x86::Gp v_fcinfo_out = EmitLoadConstUIntPtr(Jitcc, "v_fcinfo_out.uintptr",
+                                                  fcinfo_out),
+              v_fcinfo_in =
+                  EmitLoadConstUIntPtr(Jitcc, "v_fcinfo_in.uintptr", fcinfo_in);
+      x86::Gp v_output = Jitcc.newUInt64("v_output.u64");
+
+      x86::Gp v_resnullp =
+          EmitLoadConstUIntPtr(Jitcc, "op.resnullp.uintptr", Op->resnull);
+      x86::Gp v_resnull = Jitcc.newInt8("op.resnull.i8");
+      EmitLoadFromArray(Jitcc, v_resnullp, 0, v_resnull, sizeof(bool));
+
+      Jitcc.cmp(v_resnull, jit::imm(1));
+      Jitcc.je(L_SkipOutputCall);
+      {
+        /* Not null, call output. */
+        x86::Gp v_resvaluep =
+            EmitLoadConstUIntPtr(Jitcc, "op.resvalue.uintptr", Op->resvalue);
+        x86::Gp v_resvalue = Jitcc.newUIntPtr("v_resvalue");
+        EmitLoadFromArray(Jitcc, v_resvaluep, 0, v_resvalue, sizeof(Datum));
+        StoreFuncArgValue(Jitcc, v_fcinfo_out, 0, v_resvalue);
+        StoreFuncArgNull(Jitcc, v_fcinfo_out, 0, jit::imm(0));
+
+        jit::InvokeNode *PGFunc;
+        Jitcc.invoke(&PGFunc, jit::imm(fcinfo_out->flinfo->fn_addr),
+                     jit::FuncSignature::build<Datum, FunctionCallInfo>());
+        PGFunc->setArg(0, v_fcinfo_out);
+        PGFunc->setRet(0, v_output);
+        Jitcc.jmp(L_InputCall);
+      }
+
+      Jitcc.bind(L_SkipOutputCall);
+      Jitcc.mov(v_output, jit::imm(0));
+
+      Jitcc.bind(L_InputCall);
+      {
+        if (Op->d.iocoerce.finfo_in->fn_strict) {
+          Jitcc.cmp(v_output, jit::imm(0));
+          Jitcc.je(L_Opblocks[OpIndex + 1]);
+        }
+        EmitLoadFromArray(Jitcc, v_resnullp, 0, v_resnull, sizeof(bool));
+        /* Call input function. */
+        StoreFuncArgValue(Jitcc, v_fcinfo_in, 0, v_output);
+        StoreFuncArgNull(Jitcc, v_fcinfo_in, 0, v_resnull);
+        emit_store_isnull_to_FunctionCallInfoBaseData(Jitcc, v_fcinfo_in,
+                                                      jit::imm(0));
+        jit::InvokeNode *PGFunc;
+        Jitcc.invoke(&PGFunc, jit::imm(fcinfo_in->flinfo->fn_addr),
+                     jit::FuncSignature::build<Datum, FunctionCallInfo>());
+        PGFunc->setArg(0, v_fcinfo_in);
+        PGFunc->setRet(0, v_output);
+
+        x86::Gp v_resvaluep =
+            EmitLoadConstUIntPtr(Jitcc, "op.resvalue.uintptr", Op->resvalue);
+        EmitStoreToArray(Jitcc, v_resvaluep, 0, v_output, sizeof(Datum));
+      }
+      break;
     }
 
     case EEOP_IOCOERCE_SAFE: {

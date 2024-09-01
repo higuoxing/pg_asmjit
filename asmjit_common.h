@@ -143,4 +143,26 @@ static inline jit::x86::Gp LoadFuncArgValue(jit::x86::Compiler &cc,
   return v_argvalue;
 }
 
+template <typename T>
+static inline void StoreFuncArgNull(jit::x86::Compiler &cc,
+                                    jit::x86::Gp &v_fcinfo, size_t argno,
+                                    const T &v_val) {
+  EmitStoreToFlexibleArray(cc, v_fcinfo,
+                           offsetof(FunctionCallInfoBaseData, args) +
+                               argno * sizeof(NullableDatum) +
+                               offsetof(NullableDatum, isnull),
+                           0, v_val, sizeof(bool));
+}
+
+template <typename T>
+static inline void StoreFuncArgValue(jit::x86::Compiler &cc,
+                                     jit::x86::Gp &v_fcinfo, size_t argno,
+                                     const T &v_val) {
+  EmitStoreToFlexibleArray(cc, v_fcinfo,
+                           offsetof(FunctionCallInfoBaseData, args) +
+                               argno * sizeof(NullableDatum) +
+                               offsetof(NullableDatum, value),
+                           0, v_val, sizeof(Datum));
+}
+
 #endif
