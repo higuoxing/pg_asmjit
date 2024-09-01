@@ -1610,12 +1610,84 @@ bool AsmJitCompileExpr(ExprState *State) {
 
     case EEOP_AGG_STRICT_DESERIALIZE:
     case EEOP_AGG_DESERIALIZE: {
-      todo();
+      FunctionCallInfo fcinfo = Op->d.agg_deserialize.fcinfo_data;
+      x86::Gp v_fcinfo =
+          EmitLoadConstUIntPtr(Jitcc, "v_fcinfo.uintptr", fcinfo);
+
+      if (Opcode == EEOP_AGG_STRICT_DESERIALIZE) {
+        x86::Gp v_argnull0 = LoadFuncArgNull(Jitcc, v_fcinfo, 0);
+        Jitcc.cmp(v_argnull0, jit::imm(1));
+        Jitcc.je(L_Opblocks[Op->d.agg_deserialize.jumpnull]);
+      }
+
+      AggState *aggstate = castNode(AggState, State->parent);
+      x86::Gp v_tmpcontext =
+          EmitLoadConstUIntPtr(Jitcc, "v_tmpcontext.uintptr",
+                               aggstate->tmpcontext->ecxt_per_tuple_memory);
+      x86::Gp v_oldcontext = Jitcc.newUIntPtr("v_oldcontext.uintptr");
+      jit::InvokeNode *InvokeMemoryContextSwitchTo;
+      Jitcc.invoke(&InvokeMemoryContextSwitchTo,
+                   jit::imm(MemoryContextSwitchTo),
+                   jit::FuncSignature::build<MemoryContext, MemoryContext>());
+      InvokeMemoryContextSwitchTo->setArg(0, v_tmpcontext);
+      InvokeMemoryContextSwitchTo->setRet(0, v_oldcontext);
+
+      jit::InvokeNode *PGFunc;
+      x86::Gp v_retval = Jitcc.newUIntPtr("v_retval.uintptr");
+      Jitcc.invoke(&PGFunc, jit::imm(fcinfo->flinfo->fn_addr),
+                   jit::FuncSignature::build<Datum, FunctionCallInfo>());
+      PGFunc->setArg(0, fcinfo);
+      PGFunc->setRet(0, v_retval);
+      x86::Gp v_fcinfo_isnull =
+          emit_load_isnull_from_FunctionCallInfoBaseData(Jitcc, v_fcinfo);
+
+      InvokeMemoryContextSwitchTo = nullptr;
+      Jitcc.invoke(&InvokeMemoryContextSwitchTo,
+                   jit::imm(MemoryContextSwitchTo),
+                   jit::FuncSignature::build<MemoryContext, MemoryContext>());
+      InvokeMemoryContextSwitchTo->setArg(0, v_oldcontext);
+      InvokeMemoryContextSwitchTo->setRet(0, v_oldcontext);
+
+      x86::Gp v_resnullp =
+          EmitLoadConstUIntPtr(Jitcc, "op.resnullp.uintptr", Op->resnull);
+      x86::Gp v_resvaluep =
+          EmitLoadConstUIntPtr(Jitcc, "op.resvaluep.uintptr", Op->resvalue);
+      EmitStoreToArray(Jitcc, v_resnullp, 0, v_fcinfo_isnull, sizeof(bool));
+      EmitStoreToArray(Jitcc, v_resvaluep, 0, v_retval, sizeof(Datum));
+
+      break;
     }
 
     case EEOP_AGG_STRICT_INPUT_CHECK_ARGS:
     case EEOP_AGG_STRICT_INPUT_CHECK_NULLS: {
-      todo();
+      int nargs = Op->d.agg_strict_input_check.nargs;
+      NullableDatum *args = Op->d.agg_strict_input_check.args;
+      bool *nulls = Op->d.agg_strict_input_check.nulls;
+
+      Assert(nargs > 0);
+
+      int jumpnull = Op->d.agg_strict_input_check.jumpnull;
+      x86::Gp v_argsp = EmitLoadConstUIntPtr(Jitcc, "v_argsp.uintptr", args);
+      x86::Gp v_nullsp = EmitLoadConstUIntPtr(Jitcc, "v_nullsp.uintptr", nulls);
+
+      /* strict function, check for NULL args */
+      for (int argno = 0; argno < nargs; ++argno) {
+        x86::Gp v_argisnull = Jitcc.newInt8("v_argisnull.i8");
+        if (Opcode == EEOP_AGG_STRICT_INPUT_CHECK_NULLS) {
+          EmitLoadFromArray(Jitcc, v_nullsp, argno, v_argisnull, sizeof(bool));
+        } else {
+          x86::Mem m_argnisnull = x86::ptr(v_argsp,
+                                           argno * sizeof(NullableDatum) +
+                                               offsetof(NullableDatum, isnull),
+                                           sizeof(bool));
+          Jitcc.mov(v_argisnull, m_argnisnull);
+        }
+
+        Jitcc.cmp(v_argisnull, jit::imm(1));
+        Jitcc.je(L_Opblocks[jumpnull]);
+      }
+
+      break;
     }
     case EEOP_AGG_PLAIN_PERGROUP_NULLCHECK: {
       todo();
