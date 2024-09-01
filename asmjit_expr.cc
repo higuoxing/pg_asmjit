@@ -1,5 +1,3 @@
-#include "asmjit/core/compiler.h"
-#include "asmjit/core/func.h"
 #include "asmjit_common.h"
 
 namespace jit = asmjit;
@@ -934,6 +932,8 @@ bool AsmJitCompileExpr(ExprState *State) {
         EmitLoadFromArray(Jitcc, v_resvaluep, 0, v_resvalue, sizeof(Datum));
         StoreFuncArgValue(Jitcc, v_fcinfo_out, 0, v_resvalue);
         StoreFuncArgNull(Jitcc, v_fcinfo_out, 0, jit::imm(0));
+        emit_store_isnull_to_FunctionCallInfoBaseData(Jitcc, v_fcinfo_out,
+                                                      jit::imm(0));
 
         jit::InvokeNode *PGFunc;
         Jitcc.invoke(&PGFunc, jit::imm(fcinfo_out->flinfo->fn_addr),
@@ -1690,7 +1690,23 @@ bool AsmJitCompileExpr(ExprState *State) {
       break;
     }
     case EEOP_AGG_PLAIN_PERGROUP_NULLCHECK: {
-      todo();
+      int jumpnull = Op->d.agg_plain_pergroup_nullcheck.jumpnull;
+
+      /*
+       * pergroup_allaggs = aggstate->all_pergroups
+       * [op->d.agg_plain_pergroup_nullcheck.setoff];
+       */
+      x86::Gp v_aggstatep = emit_load_parent_from_ExprState(Jitcc, Expression);
+      x86::Gp v_allpergroupsp =
+          emit_load_all_pergroups_from_AggState(Jitcc, v_aggstatep);
+      x86::Gp v_pergroup_allaggs =
+          Jitcc.newUIntPtr("v_pergroup_allaggs.uintptr");
+      EmitLoadFromArray(Jitcc, v_allpergroupsp,
+                        Op->d.agg_plain_pergroup_nullcheck.setoff,
+                        v_pergroup_allaggs, sizeof(Datum));
+      Jitcc.cmp(v_pergroup_allaggs, jit::imm(0));
+      Jitcc.je(L_Opblocks[jumpnull]);
+      break;
     }
 
     case EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYVAL:
@@ -1699,13 +1715,219 @@ bool AsmJitCompileExpr(ExprState *State) {
     case EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYREF:
     case EEOP_AGG_PLAIN_TRANS_STRICT_BYREF:
     case EEOP_AGG_PLAIN_TRANS_BYREF: {
-      todo();
+      AggState *aggstate = castNode(AggState, State->parent);
+      AggStatePerTrans pertrans = Op->d.agg_trans.pertrans;
+      FunctionCallInfo fcinfo = pertrans->transfn_fcinfo;
+      x86::Gp v_aggstatep = emit_load_parent_from_ExprState(Jitcc, Expression);
+      x86::Gp v_pertransp =
+          EmitLoadConstUIntPtr(Jitcc, "v_pertransp.uintptr", pertrans);
+
+      /*
+       * pergroup = &aggstate->all_pergroups
+       * [op->d.agg_trans.setoff] [op->d.agg_trans.transno];
+       */
+      int32 setoff = Op->d.agg_trans.setoff;
+      int32 transno = Op->d.agg_trans.transno;
+      x86::Gp v_pergroupp = Jitcc.newUIntPtr("v_pergroupp.uintptr");
+      x86::Gp v_all_pergroupsp =
+          emit_load_all_pergroups_from_AggState(Jitcc, v_aggstatep);
+      EmitLoadFromArray(Jitcc, v_all_pergroupsp, setoff, v_pergroupp,
+                        sizeof(AggStatePerGroup));
+      Jitcc.add(v_pergroupp, jit::imm(transno * sizeof(AggStatePerGroupData)));
+
+      if (Opcode == EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYVAL ||
+          Opcode == EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYREF) {
+        jit::Label L_NoInit = Jitcc.newLabel();
+        x86::Gp v_notransvalue =
+            emit_load_noTransValue_from_AggStatePerGroupData(Jitcc,
+                                                             v_pergroupp);
+        Jitcc.cmp(v_notransvalue, jit::imm(1));
+        Jitcc.jne(L_NoInit);
+        {
+          /* init the transition value if necessary */
+          x86::Gp v_aggcontext = EmitLoadConstUIntPtr(
+              Jitcc, "v_aggcontext.uintptr", Op->d.agg_trans.aggcontext);
+          jit::InvokeNode *InvokeExecAggInitGroup;
+          Jitcc.invoke(
+              &InvokeExecAggInitGroup, jit::imm(ExecAggInitGroup),
+              jit::FuncSignature::build<void, AggState *, AggStatePerTrans,
+                                        AggStatePerGroup, ExprContext *>());
+          InvokeExecAggInitGroup->setArg(0, v_aggstatep);
+          InvokeExecAggInitGroup->setArg(1, v_pertransp);
+          InvokeExecAggInitGroup->setArg(2, v_pergroupp);
+          InvokeExecAggInitGroup->setArg(3, v_aggcontext);
+
+          Jitcc.jmp(L_Opblocks[OpIndex + 1]);
+        }
+
+        Jitcc.bind(L_NoInit);
+      }
+
+      if (Opcode == EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYVAL ||
+          Opcode == EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYREF ||
+          Opcode == EEOP_AGG_PLAIN_TRANS_STRICT_BYVAL ||
+          Opcode == EEOP_AGG_PLAIN_TRANS_STRICT_BYREF) {
+        x86::Gp v_transnull =
+            emit_load_transValueIsNull_from_AggStatePerGroupData(Jitcc,
+                                                                 v_pergroupp);
+        Jitcc.cmp(v_transnull, jit::imm(1));
+        Jitcc.je(L_Opblocks[OpIndex + 1]);
+      }
+
+      x86::Gp v_fcinfo =
+          EmitLoadConstUIntPtr(Jitcc, "v_fcinfo.uintptr", fcinfo);
+      x86::Gp v_aggcontext = EmitLoadConstUIntPtr(Jitcc, "v_aggcontext.uintptr",
+                                                  Op->d.agg_trans.aggcontext);
+
+      /* set aggstate globals */
+      emit_store_curaggcontext_to_AggState(Jitcc, v_aggstatep, v_aggcontext);
+      emit_store_current_set_to_AggState(Jitcc, v_aggstatep,
+                                         jit::imm(Op->d.agg_trans.setno));
+      emit_store_curpertrans_to_AggState(Jitcc, v_aggstatep, v_pertransp);
+
+      /* invoke transition function in per-tuple context */
+      x86::Gp v_tmpcontext =
+          EmitLoadConstUIntPtr(Jitcc, "v_tmpcontext.uintptr",
+                               aggstate->tmpcontext->ecxt_per_tuple_memory);
+      x86::Gp v_oldcontext = Jitcc.newUIntPtr("v_oldcontext.uintptr");
+      jit::InvokeNode *InvokeMemoryContextSwitchTo;
+      Jitcc.invoke(&InvokeMemoryContextSwitchTo,
+                   jit::imm(MemoryContextSwitchTo),
+                   jit::FuncSignature::build<MemoryContext, MemoryContext>());
+      InvokeMemoryContextSwitchTo->setArg(0, v_tmpcontext);
+      InvokeMemoryContextSwitchTo->setRet(0, v_oldcontext);
+
+      /* store transvalue in fcinfo->args[0] */
+      x86::Gp v_transvalue =
+          emit_load_transValue_from_AggStatePerGroupData(Jitcc, v_pergroupp);
+      x86::Gp v_transnull =
+          emit_load_transValueIsNull_from_AggStatePerGroupData(Jitcc,
+                                                               v_pergroupp);
+      StoreFuncArgValue(Jitcc, v_fcinfo, 0, v_transvalue);
+      StoreFuncArgNull(Jitcc, v_fcinfo, 0, v_transnull);
+      emit_store_isnull_to_FunctionCallInfoBaseData(Jitcc, v_fcinfo,
+                                                    jit::imm(0));
+
+      x86::Gp v_retval = Jitcc.newUIntPtr("v_retval.uintptr");
+      jit::InvokeNode *PGFunc;
+      Jitcc.invoke(&PGFunc, jit::imm(fcinfo->flinfo->fn_addr),
+                   jit::FuncSignature::build<Datum, FunctionCallInfo>());
+      PGFunc->setArg(0, v_fcinfo);
+      PGFunc->setRet(0, v_retval);
+      x86::Gp v_fcinfo_isnull =
+          emit_load_isnull_from_FunctionCallInfoBaseData(Jitcc, v_fcinfo);
+
+      /*
+       * For pass-by-ref datatype, must copy the new value into
+       * aggcontext and free the prior transValue.  But if
+       * transfn returned a pointer to its first input, we don't
+       * need to do anything.  Also, if transfn returned a
+       * pointer to a R/W expanded object that is already a
+       * child of the aggcontext, assume we can adopt that value
+       * without copying it.
+       */
+      if (Opcode == EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYREF ||
+          Opcode == EEOP_AGG_PLAIN_TRANS_STRICT_BYREF ||
+          Opcode == EEOP_AGG_PLAIN_TRANS_BYREF) {
+        jit::Label L_NoCall = Jitcc.newLabel();
+        x86::Gp v_transvalue =
+            emit_load_transValue_from_AggStatePerGroupData(Jitcc, v_pergroupp);
+        x86::Gp v_transnull =
+            emit_load_transValueIsNull_from_AggStatePerGroupData(Jitcc,
+                                                                 v_pergroupp);
+        Jitcc.cmp(v_transvalue, v_retval);
+        Jitcc.je(L_NoCall);
+
+        jit::InvokeNode *InvokeExecAggCopyTransValue;
+        x86::Gp v_newval = Jitcc.newUIntPtr("v_newval.uintptr");
+        Jitcc.invoke(
+            &InvokeExecAggCopyTransValue, jit::imm(ExecAggCopyTransValue),
+            jit::FuncSignature::build<Datum, AggState *, AggStatePerTrans,
+                                      Datum, bool, Datum, bool>());
+        InvokeExecAggCopyTransValue->setArg(0, v_aggstatep);
+        InvokeExecAggCopyTransValue->setArg(1, v_pertransp);
+        InvokeExecAggCopyTransValue->setArg(2, v_retval);
+        InvokeExecAggCopyTransValue->setArg(3, v_fcinfo_isnull);
+        InvokeExecAggCopyTransValue->setArg(4, v_transvalue);
+        InvokeExecAggCopyTransValue->setArg(5, v_transnull);
+        InvokeExecAggCopyTransValue->setRet(0, v_newval);
+
+        /* store trans value */
+        emit_store_transValue_to_AggStatePerGroupData(Jitcc, v_pergroupp,
+                                                      v_newval);
+        emit_store_transValueIsNull_to_AggStatePerGroupData(Jitcc, v_pergroupp,
+                                                            v_fcinfo_isnull);
+
+        InvokeMemoryContextSwitchTo = nullptr;
+        Jitcc.invoke(&InvokeMemoryContextSwitchTo,
+                     jit::imm(MemoryContextSwitchTo),
+                     jit::FuncSignature::build<MemoryContext, MemoryContext>());
+        InvokeMemoryContextSwitchTo->setArg(0, v_oldcontext);
+
+        Jitcc.jmp(L_Opblocks[OpIndex + 1]);
+
+        Jitcc.bind(L_NoCall);
+      }
+
+      /* store trans value */
+      emit_store_transValue_to_AggStatePerGroupData(Jitcc, v_pergroupp,
+                                                    v_retval);
+      emit_store_transValueIsNull_to_AggStatePerGroupData(Jitcc, v_pergroupp,
+                                                          v_fcinfo_isnull);
+
+      InvokeMemoryContextSwitchTo = nullptr;
+      Jitcc.invoke(&InvokeMemoryContextSwitchTo,
+                   jit::imm(MemoryContextSwitchTo),
+                   jit::FuncSignature::build<MemoryContext, MemoryContext>());
+      InvokeMemoryContextSwitchTo->setArg(0, v_oldcontext);
+
+      break;
     }
     case EEOP_AGG_PRESORTED_DISTINCT_SINGLE: {
-      todo();
+      AggState *aggstate = castNode(AggState, State->parent);
+      AggStatePerTrans pertrans = Op->d.agg_presorted_distinctcheck.pertrans;
+      int jumpdistinct = Op->d.agg_presorted_distinctcheck.jumpdistinct;
+      x86::Gp v_aggstatep =
+          EmitLoadConstUIntPtr(Jitcc, "v_aggstate.uintptr", aggstate);
+      x86::Gp v_pertrans =
+          EmitLoadConstUIntPtr(Jitcc, "v_pertrans.uintptr", pertrans);
+      x86::Gp v_retval = Jitcc.newInt8("v_retval.i8");
+      jit::InvokeNode *InvokeExecEvalPreOrderedDistinctSingle;
+      Jitcc.invoke(
+          &InvokeExecEvalPreOrderedDistinctSingle,
+          jit::imm(ExecEvalPreOrderedDistinctSingle),
+          jit::FuncSignature::build<bool, AggState *, AggStatePerTrans>());
+      InvokeExecEvalPreOrderedDistinctSingle->setArg(0, v_aggstatep);
+      InvokeExecEvalPreOrderedDistinctSingle->setArg(1, v_pertrans);
+      InvokeExecEvalPreOrderedDistinctSingle->setRet(0, v_retval);
+
+      Jitcc.cmp(v_retval, 1);
+      Jitcc.jne(L_Opblocks[jumpdistinct]);
+
+      break;
     }
     case EEOP_AGG_PRESORTED_DISTINCT_MULTI: {
-      todo();
+      AggState *aggstate = castNode(AggState, State->parent);
+      AggStatePerTrans pertrans = Op->d.agg_presorted_distinctcheck.pertrans;
+      int jumpdistinct = Op->d.agg_presorted_distinctcheck.jumpdistinct;
+      x86::Gp v_aggstatep =
+          EmitLoadConstUIntPtr(Jitcc, "v_aggstate.uintptr", aggstate);
+      x86::Gp v_pertrans =
+          EmitLoadConstUIntPtr(Jitcc, "v_pertrans.uintptr", pertrans);
+      x86::Gp v_retval = Jitcc.newInt8("v_retval.i8");
+      jit::InvokeNode *InvokeExecEvalPreOrderedDistinctMulti;
+      Jitcc.invoke(
+          &InvokeExecEvalPreOrderedDistinctMulti,
+          jit::imm(ExecEvalPreOrderedDistinctMulti),
+          jit::FuncSignature::build<bool, AggState *, AggStatePerTrans>());
+      InvokeExecEvalPreOrderedDistinctMulti->setArg(0, v_aggstatep);
+      InvokeExecEvalPreOrderedDistinctMulti->setArg(1, v_pertrans);
+      InvokeExecEvalPreOrderedDistinctMulti->setRet(0, v_retval);
+
+      Jitcc.cmp(v_retval, 1);
+      Jitcc.jne(L_Opblocks[jumpdistinct]);
+
+      break;
     }
 
     case EEOP_AGG_ORDERED_TRANS_DATUM: {
