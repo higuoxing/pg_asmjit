@@ -1,13 +1,9 @@
 # pg_asmjit
 
-> An alternative JIT provider for PostgreSQL based on AsmJit. (WIP)
+> An alternative JIT provider for PostgreSQL based on AsmJit.
 
 > [!WARNING]
-> I implemented only a few operators, please don't use it!
-
-## Requirements
-
-- PostgreSQL 17 https://github.com/postgres/postgres/commit/06a0f4d52be3a52a74725dd29c66cd486256a209.
+> Currently, it only works with latest PostgreSQL (master branch).
 
 ## Build
 
