@@ -170,12 +170,6 @@ bool AsmJitCompileExpr(ExprState *State) {
     JitFunc->setArg(2, EContext);                                              \
   } while (0);
 
-#define todo()                                                                 \
-  do {                                                                         \
-    elog(LOG, "TODO: Opcode (%d)", Opcode);                                    \
-    return false;                                                              \
-  } while (0);
-
     switch (Opcode) {
     case EEOP_DONE: {
       /* Load expression->resvalue and expression->resnull */
