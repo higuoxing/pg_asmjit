@@ -1828,6 +1828,18 @@ bool AsmJitCompileExpr(ExprState *State) {
         Jitcc.cmp(v_transvalue, v_retval);
         Jitcc.je(L_NoCall);
 
+        /* store trans value */
+        {
+          /*
+           * FIXME: It's seems v_transvalue is not properly loaded in -O3 and I
+           * don't know why.
+           */
+          v_transvalue = emit_load_transValue_from_AggStatePerGroupData(
+              Jitcc, v_pergroupp);
+          v_transnull = emit_load_transValueIsNull_from_AggStatePerGroupData(
+              Jitcc, v_pergroupp);
+        }
+
         jit::InvokeNode *InvokeExecAggCopyTransValue;
         x86::Gp v_newval = Jitcc.newUIntPtr("v_newval.uintptr");
         Jitcc.invoke(
