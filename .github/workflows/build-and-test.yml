@@ -1,11 +1,14 @@
 name: Build and Test
 on: [push, pull_request]
 jobs:
-  ubuntu:
+  test_with_postgresql:
     runs-on: ubuntu-22.04
     if: ${{ !startsWith(github.ref_name, 'mac') && !startsWith(github.ref_name, 'windows') }}
     strategy:
       fail-fast: false
+      matrix:
+        opt_level: ['-O0', '-O1', '-O2', '-O3']
+        compiler: ['gcc', 'clang']
     steps:
       - uses: actions/checkout@v4
         with:
@@ -14,7 +17,8 @@ jobs:
           # Install PostgreSQL server.
           git clone https://github.com/postgres/postgres --depth=1 pg
           cd pg
-          ./configure --prefix=$HOME/.local/pg --enable-cassert --enable-debug
+          CFLAGS="${{ matrix.opt_level }}" CC="${{ matrix.compiler }}" CXX="${{ matrix.compiler == 'gcc' && 'g++' || 'clang++' }}" \
+            ./configure --prefix=$HOME/.local/pg --enable-cassert
           make install-world-bin -j4
           # Install pg_asmjit.
           cd ..
