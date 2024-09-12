@@ -1770,6 +1770,13 @@ bool AsmJitCompileExpr(ExprState *State) {
                                                   op->d.agg_trans.aggcontext);
 
       /* set aggstate globals */
+      {
+        /*
+         * FIXME: I don't know why v_aggstatep is nullptr in -O2 if we don't
+         * load it here. Need to investigate more.
+         */
+        v_aggstatep = emit_load_parent_from_ExprState(Jitcc, v_state);
+      }
       emit_store_curaggcontext_to_AggState(Jitcc, v_aggstatep, v_aggcontext);
       emit_store_current_set_to_AggState(Jitcc, v_aggstatep,
                                          jit::imm(op->d.agg_trans.setno));
