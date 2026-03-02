@@ -1,8 +1,5 @@
 #include "asmjit_common.h"
 
-namespace jit = asmjit;
-namespace x86 = asmjit::x86;
-
 extern "C" {
 
 static bool JitSessionInitialized = false;
@@ -67,13 +64,9 @@ static void JitInitializeSession(void) {
 
   JitSessionInitialized = true;
 
-  /*
-   * pg_asmjit only has an x86/x86-64 backend. Decline to JIT on any other
-   * architecture rather than emitting x86 machine code and crashing when it
-   * is executed on the host CPU.
-   */
   jit::Arch arch = Runtime.environment().arch();
-  JitArchSupported = (arch == jit::Arch::kX86 || arch == jit::Arch::kX64);
+  JitArchSupported = (arch == jit::Arch::kX86 || arch == jit::Arch::kX64 ||
+                      arch == jit::Arch::kAArch64);
   if (!JitArchSupported)
     elog(LOG, "pg_asmjit: unsupported architecture, JIT disabled");
 }
@@ -135,29 +128,29 @@ bool AsmJitCompileExpr(ExprState *State) {
   INSTR_TIME_SET_CURRENT(CodeGenStartTime);
 
   jit::CodeHolder Code;
-  Code.init(Runtime.environment(), Runtime.cpuFeatures());
-  x86::Compiler Jitcc(&Code);
+  Code.init(Runtime.environment(), Runtime.cpu_features());
+  arch::Compiler Jitcc(&Code);
 
   /*
    * Datum ExprStateEvalFunc(struct ExprState *expression,
    *                         struct ExprContext *econtext,
    *                         bool *isNull);
    */
-  jit::FuncNode *JittedFunc = Jitcc.addFunc(
+  jit::FuncNode *JittedFunc = Jitcc.add_func(
       jit::FuncSignature::build<Datum, ExprState *, ExprContext *, bool *>());
 
-  x86::Gp v_state = Jitcc.newUIntPtr("v_state.uintptr"),
-          v_econtext = Jitcc.newUIntPtr("v_econtext.uintptr"),
-          v_isnullp = Jitcc.newUIntPtr("v_isnullp.uintptr");
+  arch::Gp v_state = Jitcc.new_gp_ptr("v_state"),
+           v_econtext = Jitcc.new_gp_ptr("v_econtext"),
+           v_isnullp = Jitcc.new_gp_ptr("v_isnullp");
 
-  JittedFunc->setArg(0, v_state);
-  JittedFunc->setArg(1, v_econtext);
-  JittedFunc->setArg(2, v_isnullp);
+  JittedFunc->set_arg(0, v_state);
+  JittedFunc->set_arg(1, v_econtext);
+  JittedFunc->set_arg(2, v_isnullp);
 
   jit::Label *L_opblocks =
       (jit::Label *)palloc(State->steps_len * sizeof(jit::Label));
   for (int opno = 0; opno < State->steps_len; ++opno)
-    L_opblocks[opno] = Jitcc.newLabel();
+    L_opblocks[opno] = Jitcc.new_label();
 
   for (int opno = 0; opno < State->steps_len; ++opno) {
     ExprEvalStep *op = &State->steps[opno];
@@ -168,36 +161,35 @@ bool AsmJitCompileExpr(ExprState *State) {
 #define BuildEvalXFunc2(Func)                                                  \
   do {                                                                         \
     jit::InvokeNode *JitFunc;                                                  \
-    Jitcc.invoke(                                                              \
-        &JitFunc, jit::imm(Func),                                              \
-        jit::FuncSignature::build<void, ExprState *, ExprEvalStep *>());       \
-    JitFunc->setArg(0, v_state);                                               \
-    JitFunc->setArg(1, jit::imm(op));                                          \
+    Jitcc.invoke(asmjit::Out(JitFunc), JIT_FN_PTR(Jitcc, Func),               \
+                 jit::FuncSignature::build<void, ExprState *, ExprEvalStep *>()); \
+    JitFunc->set_arg(0, v_state);                                              \
+    JitFunc->set_arg(1, jit::imm(op));                                         \
   } while (0);
 
 #define BuildEvalXFunc3(Func)                                                  \
   do {                                                                         \
     jit::InvokeNode *JitFunc;                                                  \
-    Jitcc.invoke(&JitFunc, jit::imm(Func),                                     \
+    Jitcc.invoke(asmjit::Out(JitFunc), JIT_FN_PTR(Jitcc, Func),               \
                  jit::FuncSignature::build<void, ExprState *, ExprEvalStep *,  \
                                            ExprContext *>());                  \
-    JitFunc->setArg(0, v_state);                                               \
-    JitFunc->setArg(1, jit::imm(op));                                          \
-    JitFunc->setArg(2, v_econtext);                                            \
+    JitFunc->set_arg(0, v_state);                                              \
+    JitFunc->set_arg(1, jit::imm(op));                                         \
+    JitFunc->set_arg(2, v_econtext);                                           \
   } while (0);
 
     switch (opcode) {
     case EEOP_DONE_RETURN: {
       /* Load expression->resvalue and expression->resnull */
-      x86::Gp v_resvalue = emit_load_resvalue_from_ExprState(Jitcc, v_state),
-              v_resnull = emit_load_resnull_from_ExprState(Jitcc, v_state);
+      arch::Gp v_resvalue = emit_load_resvalue_from_ExprState(Jitcc, v_state),
+               v_resnull = emit_load_resnull_from_ExprState(Jitcc, v_state);
 
       /* *isnull = expression->resnull */
       EmitStoreToArray(Jitcc, v_isnullp, 0, v_resnull, sizeof(bool));
 
       /* return expression->resvalue */
       Jitcc.ret(v_resvalue);
-      Jitcc.endFunc();
+      Jitcc.end_func();
       break;
     }
     case EEOP_INNER_FETCHSOME:
@@ -212,7 +204,7 @@ bool AsmJitCompileExpr(ExprState *State) {
       Assert(tts_ops != &TTSOpsVirtual);
 
       /* Compute the address of Slot->tts_nvalid */
-      x86::Gp v_slot =
+      arch::Gp v_slot =
           opcode == EEOP_INNER_FETCHSOME
               ? emit_load_ecxt_innertuple_from_ExprContext(Jitcc, v_econtext)
               : (opcode == EEOP_OUTER_FETCHSOME
@@ -221,15 +213,15 @@ bool AsmJitCompileExpr(ExprState *State) {
                      : emit_load_ecxt_scantuple_from_ExprContext(Jitcc,
                                                                  v_econtext));
 
-      x86::Gp v_nvalid =
+      arch::Gp v_nvalid =
           emit_load_tts_nvalid_from_TupleTableSlot(Jitcc, v_slot);
 
       /*
        * Check if all required attributes are available, or whether deforming is
        * required.
        */
-      Jitcc.cmp(v_nvalid, jit::imm(op->d.fetch.last_var));
-      Jitcc.jge(L_opblocks[opno + 1]);
+      EmitCondJumpGE(Jitcc, v_nvalid, op->d.fetch.last_var,
+                     L_opblocks[opno + 1]);
 
       if (tts_ops && desc && (Context->base.flags & PGJIT_DEFORM)) {
         INSTR_TIME_SET_CURRENT(DeformStartTime);
@@ -245,14 +237,14 @@ bool AsmJitCompileExpr(ExprState *State) {
       jit::InvokeNode *SlotGetSomeAttrsInt = nullptr;
       if (jit_deform) {
         /* Invoke the JIT-ed deforming function. */
-        Jitcc.invoke(&SlotGetSomeAttrsInt, jit::imm(jit_deform),
+        Jitcc.invoke(asmjit::Out(SlotGetSomeAttrsInt), JIT_FN_PTR(Jitcc, jit_deform),
                      jit::FuncSignature::build<void, TupleTableSlot *>());
-        SlotGetSomeAttrsInt->setArg(0, v_slot);
+        SlotGetSomeAttrsInt->set_arg(0, v_slot);
       } else {
-        Jitcc.invoke(&SlotGetSomeAttrsInt, jit::imm(slot_getsomeattrs_int),
+        Jitcc.invoke(asmjit::Out(SlotGetSomeAttrsInt), JIT_FN_PTR(Jitcc, slot_getsomeattrs_int),
                      jit::FuncSignature::build<void, TupleTableSlot *, int>());
-        SlotGetSomeAttrsInt->setArg(0, v_slot);
-        SlotGetSomeAttrsInt->setArg(1, jit::imm(op->d.fetch.last_var));
+        SlotGetSomeAttrsInt->set_arg(0, v_slot);
+        SlotGetSomeAttrsInt->set_arg(1, jit::imm(op->d.fetch.last_var));
       }
 
       break;
@@ -261,7 +253,7 @@ bool AsmJitCompileExpr(ExprState *State) {
     case EEOP_INNER_VAR:
     case EEOP_OUTER_VAR:
     case EEOP_SCAN_VAR: {
-      x86::Gp v_slot =
+      arch::Gp v_slot =
           opcode == EEOP_INNER_VAR
               ? emit_load_ecxt_innertuple_from_ExprContext(Jitcc, v_econtext)
               : (opcode == EEOP_OUTER_VAR
@@ -270,20 +262,21 @@ bool AsmJitCompileExpr(ExprState *State) {
                      : emit_load_ecxt_scantuple_from_ExprContext(Jitcc,
                                                                  v_econtext));
 
-      x86::Gp v_values =
+      arch::Gp v_values =
                   emit_load_tts_values_from_TupleTableSlot(Jitcc, v_slot),
-              v_nulls = emit_load_tts_isnull_from_TupleTableSlot(Jitcc, v_slot);
+               v_nulls =
+                   emit_load_tts_isnull_from_TupleTableSlot(Jitcc, v_slot);
 
       int attnum = op->d.var.attnum;
 
-      x86::Gp v_value = Jitcc.newUIntPtr(), v_isnull = Jitcc.newInt8();
+      arch::Gp v_value = Jitcc.new_gp_ptr(), v_isnull = Jitcc.new_gp32();
       EmitLoadFromArray(Jitcc, v_values, attnum, v_value, sizeof(Datum));
       EmitLoadFromArray(Jitcc, v_nulls, attnum, v_isnull, sizeof(bool));
 
-      x86::Gp v_resvaluep = EmitLoadConstUIntPtr(Jitcc, "v_resvaluep.uintptr",
-                                                 op->resvalue),
-              v_resnullp = EmitLoadConstUIntPtr(Jitcc, "v_resnullp.uintptr",
-                                                op->resnull);
+      arch::Gp v_resvaluep = EmitLoadConstUIntPtr(Jitcc, "v_resvaluep",
+                                                  op->resvalue),
+               v_resnullp =
+                   EmitLoadConstUIntPtr(Jitcc, "v_resnullp", op->resnull);
 
       EmitStoreToArray(Jitcc, v_resvaluep, 0, v_value, sizeof(Datum));
       EmitStoreToArray(Jitcc, v_resnullp, 0, v_isnull, sizeof(bool));
@@ -293,7 +286,7 @@ bool AsmJitCompileExpr(ExprState *State) {
     case EEOP_INNER_SYSVAR:
     case EEOP_OUTER_SYSVAR:
     case EEOP_SCAN_SYSVAR: {
-      x86::Gp v_slot =
+      arch::Gp v_slot =
           opcode == EEOP_INNER_VAR
               ? emit_load_ecxt_innertuple_from_ExprContext(Jitcc, v_econtext)
               : (opcode == EEOP_OUTER_SYSVAR
@@ -303,14 +296,14 @@ bool AsmJitCompileExpr(ExprState *State) {
                                                                  v_econtext));
 
       jit::InvokeNode *ExecEvalSysVarFunc;
-      Jitcc.invoke(
-          &ExecEvalSysVarFunc, jit::imm(ExecEvalSysVar),
+      Jitcc.invoke(asmjit::Out(ExecEvalSysVarFunc),
+           JIT_FN_PTR(Jitcc, ExecEvalSysVar),
           jit::FuncSignature::build<void, ExprState *, ExprEvalStep *,
                                     ExprContext *, TupleTableSlot *>());
-      ExecEvalSysVarFunc->setArg(0, v_state);
-      ExecEvalSysVarFunc->setArg(1, jit::imm(op));
-      ExecEvalSysVarFunc->setArg(2, v_econtext);
-      ExecEvalSysVarFunc->setArg(3, v_slot);
+      ExecEvalSysVarFunc->set_arg(0, v_state);
+      ExecEvalSysVarFunc->set_arg(1, jit::imm(op));
+      ExecEvalSysVarFunc->set_arg(2, v_econtext);
+      ExecEvalSysVarFunc->set_arg(3, v_slot);
       break;
     }
 
@@ -322,7 +315,7 @@ bool AsmJitCompileExpr(ExprState *State) {
     case EEOP_ASSIGN_INNER_VAR:
     case EEOP_ASSIGN_OUTER_VAR:
     case EEOP_ASSIGN_SCAN_VAR: {
-      x86::Gp v_slot =
+      arch::Gp v_slot =
           opcode == EEOP_ASSIGN_INNER_VAR
               ? emit_load_ecxt_innertuple_from_ExprContext(Jitcc, v_econtext)
               : (opcode == EEOP_ASSIGN_OUTER_VAR
@@ -331,26 +324,27 @@ bool AsmJitCompileExpr(ExprState *State) {
                      : emit_load_ecxt_scantuple_from_ExprContext(Jitcc,
                                                                  v_econtext));
 
-      x86::Gp v_values =
+      arch::Gp v_values =
                   emit_load_tts_values_from_TupleTableSlot(Jitcc, v_slot),
-              v_nulls = emit_load_tts_isnull_from_TupleTableSlot(Jitcc, v_slot);
+               v_nulls =
+                   emit_load_tts_isnull_from_TupleTableSlot(Jitcc, v_slot);
 
       int attnum = op->d.assign_var.attnum;
 
       /* Load data. */
-      x86::Gp v_value = Jitcc.newUIntPtr("v_value.uintptr"),
-              v_null = Jitcc.newInt8("v_null.i8");
+      arch::Gp v_value = Jitcc.new_gp_ptr("v_value"),
+               v_null = Jitcc.new_gp32("v_null");
       EmitLoadFromArray(Jitcc, v_values, attnum, v_value, sizeof(Datum));
       EmitLoadFromArray(Jitcc, v_nulls, attnum, v_null, sizeof(bool));
 
       /* Save the result. */
       int resultnum = op->d.assign_var.resultnum;
-      x86::Gp v_resultslot =
+      arch::Gp v_resultslot =
           emit_load_resultslot_from_ExprState(Jitcc, v_state);
-      x86::Gp v_rvaluep =
+      arch::Gp v_rvaluep =
                   emit_load_tts_values_from_TupleTableSlot(Jitcc, v_resultslot),
-              v_risnullp =
-                  emit_load_tts_isnull_from_TupleTableSlot(Jitcc, v_resultslot);
+               v_risnullp =
+                   emit_load_tts_isnull_from_TupleTableSlot(Jitcc, v_resultslot);
 
       EmitStoreToArray(Jitcc, v_rvaluep, resultnum, v_value, sizeof(Datum));
       EmitStoreToArray(Jitcc, v_risnullp, resultnum, v_null, sizeof(bool));
@@ -363,35 +357,27 @@ bool AsmJitCompileExpr(ExprState *State) {
       size_t resultnum = op->d.assign_tmp.resultnum;
 
       /* Load expression->resvalue and expression->resnull */
-      x86::Gp v_rvalue = emit_load_resvalue_from_ExprState(Jitcc, v_state),
-              v_risnull = emit_load_resnull_from_ExprState(Jitcc, v_state);
+      arch::Gp v_rvalue = emit_load_resvalue_from_ExprState(Jitcc, v_state),
+               v_risnull = emit_load_resnull_from_ExprState(Jitcc, v_state);
 
-      /*
-       * Compute the addresses of
-       * expression->resultslot->tts_values[ResultNum] and
-       * expression->resultslot->tts_isnull[ResultNum]
-       */
-      x86::Gp v_resultslot =
+      arch::Gp v_resultslot =
           emit_load_resultslot_from_ExprState(Jitcc, v_state);
-      x86::Gp v_tmpvaluep =
+      arch::Gp v_tmpvaluep =
                   emit_load_tts_values_from_TupleTableSlot(Jitcc, v_resultslot),
-              v_tmpisnullp =
-                  emit_load_tts_isnull_from_TupleTableSlot(Jitcc, v_resultslot);
-      /*
-       * Store nullness.
-       */
+               v_tmpisnullp =
+                   emit_load_tts_isnull_from_TupleTableSlot(Jitcc, v_resultslot);
+
       EmitStoreToArray(Jitcc, v_tmpisnullp, resultnum, v_risnull, sizeof(bool));
 
       if (opcode == EEOP_ASSIGN_TMP_MAKE_RO) {
-        Jitcc.cmp(v_risnull, jit::imm(1));
-        Jitcc.je(L_opblocks[opno + 1]);
+        EmitCondJumpEQ(Jitcc, v_risnull, 1, L_opblocks[opno + 1]);
 
         jit::InvokeNode *MakeExpandedObjectReadOnlyInternalFunc;
-        Jitcc.invoke(&MakeExpandedObjectReadOnlyInternalFunc,
-                     jit::imm(MakeExpandedObjectReadOnlyInternal),
+        Jitcc.invoke(asmjit::Out(MakeExpandedObjectReadOnlyInternalFunc),
+                     JIT_FN_PTR(Jitcc, MakeExpandedObjectReadOnlyInternal),
                      jit::FuncSignature::build<Datum, Datum>());
-        MakeExpandedObjectReadOnlyInternalFunc->setArg(0, v_rvalue);
-        MakeExpandedObjectReadOnlyInternalFunc->setRet(0, v_rvalue);
+        MakeExpandedObjectReadOnlyInternalFunc->set_arg(0, v_rvalue);
+        MakeExpandedObjectReadOnlyInternalFunc->set_ret(0, v_rvalue);
       }
 
       /* Finally, store the result. */
@@ -399,34 +385,33 @@ bool AsmJitCompileExpr(ExprState *State) {
       break;
     }
     case EEOP_CONST: {
-      x86::Gp v_constvalue = EmitLoadConstUInt64(Jitcc, "constval.value.u64",
-                                                 op->d.constval.value),
-              v_constnull = EmitLoadConstUInt8(Jitcc, "constval.isnull.u8",
-                                               op->d.constval.isnull);
+      arch::Gp v_constvalue = EmitLoadConstUInt64(Jitcc, "constval.value",
+                                                  op->d.constval.value),
+               v_constnull = EmitLoadConstUInt8(Jitcc, "constval.isnull",
+                                                op->d.constval.isnull);
 
-      /*
-       * Store Op->d.constval.value to Op->resvalue.
-       * Store Op->d.constval.isnull to Op->resnull.
-       */
-      x86::Gp v_resvaluep = EmitLoadConstUIntPtr(Jitcc, "op.resvalue.uintptr",
-                                                 op->resvalue),
-              v_resnullp = EmitLoadConstUIntPtr(Jitcc, "op.resnull.uintptr",
-                                                op->resnull);
+      arch::Gp v_resvaluep =
+                  EmitLoadConstUIntPtr(Jitcc, "op.resvalue", op->resvalue),
+               v_resnullp =
+                   EmitLoadConstUIntPtr(Jitcc, "op.resnull", op->resnull);
       EmitStoreToArray(Jitcc, v_resvaluep, 0, v_constvalue, sizeof(Datum));
       EmitStoreToArray(Jitcc, v_resnullp, 0, v_constnull, sizeof(bool));
 
       break;
     }
     case EEOP_FUNCEXPR:
-    case EEOP_FUNCEXPR_STRICT: {
+    case EEOP_FUNCEXPR_STRICT:
+    case EEOP_FUNCEXPR_STRICT_1:
+    case EEOP_FUNCEXPR_STRICT_2: {
       FunctionCallInfo fcinfo = op->d.func.fcinfo_data;
-      x86::Gp v_fcinfo =
-          EmitLoadConstUIntPtr(Jitcc, "v_fcinfo.uintptr", fcinfo);
+      arch::Gp v_fcinfo = EmitLoadConstUIntPtr(Jitcc, "v_fcinfo", fcinfo);
 
-      jit::Label L_InvokePGFunc = Jitcc.newLabel();
+      jit::Label L_InvokePGFunc = Jitcc.new_label();
 
-      if (opcode == EEOP_FUNCEXPR_STRICT) {
-        jit::Label L_StrictFail = Jitcc.newLabel();
+      if (opcode == EEOP_FUNCEXPR_STRICT ||
+          opcode == EEOP_FUNCEXPR_STRICT_1 ||
+          opcode == EEOP_FUNCEXPR_STRICT_2) {
+        jit::Label L_StrictFail = Jitcc.new_label();
         /* Should make sure that they're optimized beforehand. */
         int argnum = op->d.func.nargs;
         if (argnum == 0) {
@@ -436,19 +421,18 @@ bool AsmJitCompileExpr(ExprState *State) {
 
         /* Check for NULL args for strict function. */
         for (int argno = 0; argno < argnum; ++argno) {
-          x86::Gp v_argisnull = LoadFuncArgNull(Jitcc, v_fcinfo, argno);
-          Jitcc.cmp(v_argisnull, jit::imm(1));
-          Jitcc.je(L_StrictFail);
+          arch::Gp v_argisnull = LoadFuncArgNull(Jitcc, v_fcinfo, argno);
+          EmitCondJumpEQ(Jitcc, v_argisnull, 1, L_StrictFail);
         }
 
-        Jitcc.jmp(L_InvokePGFunc);
+        EmitJump(Jitcc, L_InvokePGFunc);
 
         Jitcc.bind(L_StrictFail);
         /* Op->resnull = true */
-        x86::Gp v_resnullp =
-            EmitLoadConstUIntPtr(Jitcc, "v_resnullp.uintptr", op->resnull);
+        arch::Gp v_resnullp =
+            EmitLoadConstUIntPtr(Jitcc, "v_resnullp", op->resnull);
         EmitStoreToArray(Jitcc, v_resnullp, 0, jit::imm(1), sizeof(bool));
-        Jitcc.jmp(L_opblocks[opno + 1]);
+        EmitJump(Jitcc, L_opblocks[opno + 1]);
       }
 
       /*
@@ -459,20 +443,20 @@ bool AsmJitCompileExpr(ExprState *State) {
                                                     jit::imm(0));
 
       jit::InvokeNode *PGFunc;
-      x86::Gp v_retval = Jitcc.newUIntPtr("v_retval.uintptr");
-      Jitcc.invoke(&PGFunc, jit::imm(fcinfo->flinfo->fn_addr),
+      arch::Gp v_retval = Jitcc.new_gp_ptr("v_retval");
+      Jitcc.invoke(asmjit::Out(PGFunc), JIT_FN_PTR(Jitcc, fcinfo->flinfo->fn_addr),
                    jit::FuncSignature::build<Datum, FunctionCallInfo>());
-      PGFunc->setArg(0, v_fcinfo);
-      PGFunc->setRet(0, v_retval);
+      PGFunc->set_arg(0, v_fcinfo);
+      PGFunc->set_ret(0, v_retval);
 
       /* Write result values. */
-      x86::Gp v_resvaluep = EmitLoadConstUIntPtr(Jitcc, "v_resvaluep.uintptr",
-                                                 op->resvalue),
-              v_resnullp = EmitLoadConstUIntPtr(Jitcc, "v_resnullp.uintptr",
-                                                op->resnull);
+      arch::Gp v_resvaluep =
+                  EmitLoadConstUIntPtr(Jitcc, "v_resvaluep", op->resvalue),
+               v_resnullp =
+                   EmitLoadConstUIntPtr(Jitcc, "v_resnullp", op->resnull);
 
       EmitStoreToArray(Jitcc, v_resvaluep, 0, v_retval, sizeof(Datum));
-      x86::Gp v_fcinfo_isnull =
+      arch::Gp v_fcinfo_isnull =
           emit_load_isnull_from_FunctionCallInfoBaseData(Jitcc, v_fcinfo);
       EmitStoreToArray(Jitcc, v_resnullp, 0, v_fcinfo_isnull, sizeof(bool));
 
@@ -496,52 +480,47 @@ bool AsmJitCompileExpr(ExprState *State) {
     case EEOP_BOOL_AND_STEP_FIRST:
     case EEOP_BOOL_AND_STEP:
     case EEOP_BOOL_AND_STEP_LAST: {
-      x86::Gp v_boolanynullp = EmitLoadConstUIntPtr(
+      arch::Gp v_boolanynullp = EmitLoadConstUIntPtr(
           Jitcc, "op.d.boolexpr.anynull", op->d.boolexpr.anynull);
-      jit::Label L_BoolCheckFalse = Jitcc.newLabel(),
-                 L_BoolCont = Jitcc.newLabel();
+      jit::Label L_BoolCheckFalse = Jitcc.new_label(),
+                 L_BoolCont = Jitcc.new_label();
 
       if (opcode == EEOP_BOOL_AND_STEP_FIRST)
         EmitStoreToArray(Jitcc, v_boolanynullp, 0, jit::imm(0), sizeof(bool));
 
-      x86::Gp v_resvaluep = EmitLoadConstUIntPtr(Jitcc, "v_resvaluep.uintptr",
-                                                 op->resvalue),
-              v_resnullp = EmitLoadConstUIntPtr(Jitcc, "v_resnullp.uintptr",
-                                                op->resnull);
-      x86::Gp v_boolvalue = Jitcc.newUIntPtr("v_boolvalue.uintptr"),
-              v_boolnull = Jitcc.newInt8("v_boolnull.i8");
+      arch::Gp v_resvaluep =
+                  EmitLoadConstUIntPtr(Jitcc, "v_resvaluep", op->resvalue),
+               v_resnullp =
+                   EmitLoadConstUIntPtr(Jitcc, "v_resnullp", op->resnull);
+      arch::Gp v_boolvalue = Jitcc.new_gp_ptr("v_boolvalue"),
+               v_boolnull = Jitcc.new_gp32("v_boolnull");
 
       EmitLoadFromArray(Jitcc, v_resvaluep, 0, v_boolvalue, sizeof(Datum));
       EmitLoadFromArray(Jitcc, v_resnullp, 0, v_boolnull, sizeof(bool));
 
       /* check if current input is NULL */
-      Jitcc.cmp(v_boolnull, jit::imm(1));
-      Jitcc.jne(L_BoolCheckFalse);
+      EmitCondJumpNE(Jitcc, v_boolnull, 1, L_BoolCheckFalse);
       {
         /* b_boolisnull */
         /* set boolanynull to true */
         EmitStoreToArray(Jitcc, v_boolanynullp, 0, jit::imm(1), sizeof(bool));
-        Jitcc.jmp(L_BoolCont);
+        EmitJump(Jitcc, L_BoolCont);
       }
 
       Jitcc.bind(L_BoolCheckFalse);
       {
-        Jitcc.cmp(v_boolvalue, jit::imm(0));
-        Jitcc.jne(L_BoolCont);
+        EmitCondJumpNE(Jitcc, v_boolvalue, 0, L_BoolCont);
 
         /* b_boolisfalse */
-        /* result is already set to FALSE, need not change it */
-        /* and jump to the end of the AND expression */
-        Jitcc.jmp(L_opblocks[op->d.boolexpr.jumpdone]);
+        EmitJump(Jitcc, L_opblocks[op->d.boolexpr.jumpdone]);
       }
 
       Jitcc.bind(L_BoolCont);
       {
-        x86::Gp v_boolanynull = Jitcc.newInt8("v_boolanynull.i8");
+        arch::Gp v_boolanynull = Jitcc.new_gp32("v_boolanynull");
         EmitLoadFromArray(Jitcc, v_boolanynullp, 0, v_boolanynull,
                           sizeof(bool));
-        Jitcc.cmp(v_boolanynull, jit::imm(0));
-        Jitcc.je(L_opblocks[opno + 1]);
+        EmitCondJumpEQ(Jitcc, v_boolanynull, 0, L_opblocks[opno + 1]);
       }
 
       /* set resnull to true */
@@ -559,52 +538,47 @@ bool AsmJitCompileExpr(ExprState *State) {
     case EEOP_BOOL_OR_STEP_FIRST:
     case EEOP_BOOL_OR_STEP:
     case EEOP_BOOL_OR_STEP_LAST: {
-      x86::Gp v_boolanynullp = EmitLoadConstUIntPtr(
-          Jitcc, "v_boolanynullp.uintptr", op->d.boolexpr.anynull);
-      jit::Label L_BoolCheckTrue = Jitcc.newLabel(),
-                 L_BoolCont = Jitcc.newLabel();
+      arch::Gp v_boolanynullp = EmitLoadConstUIntPtr(
+          Jitcc, "v_boolanynullp", op->d.boolexpr.anynull);
+      jit::Label L_BoolCheckTrue = Jitcc.new_label(),
+                 L_BoolCont = Jitcc.new_label();
 
       if (opcode == EEOP_BOOL_OR_STEP_FIRST)
         EmitStoreToArray(Jitcc, v_boolanynullp, 0, jit::imm(0), sizeof(bool));
 
-      x86::Gp v_resvaluep = EmitLoadConstUIntPtr(Jitcc, "v_resvaluep.uintptr",
-                                                 op->resvalue),
-              v_resnullp = EmitLoadConstUIntPtr(Jitcc, "v_resnullp.uintptr",
-                                                op->resnull);
-      x86::Gp v_boolvalue = Jitcc.newUIntPtr("v_boolvalue.uintptr"),
-              v_boolnull = Jitcc.newInt8("v_boolnull.i8");
+      arch::Gp v_resvaluep =
+                  EmitLoadConstUIntPtr(Jitcc, "v_resvaluep", op->resvalue),
+               v_resnullp =
+                   EmitLoadConstUIntPtr(Jitcc, "v_resnullp", op->resnull);
+      arch::Gp v_boolvalue = Jitcc.new_gp_ptr("v_boolvalue"),
+               v_boolnull = Jitcc.new_gp32("v_boolnull");
 
       EmitLoadFromArray(Jitcc, v_resvaluep, 0, v_boolvalue, sizeof(Datum));
       EmitLoadFromArray(Jitcc, v_resnullp, 0, v_boolnull, sizeof(bool));
 
       /* check if current input is NULL */
-      Jitcc.cmp(v_boolnull, jit::imm(1));
-      Jitcc.jne(L_BoolCheckTrue);
+      EmitCondJumpNE(Jitcc, v_boolnull, 1, L_BoolCheckTrue);
       {
         /* b_boolisnull */
         /* set boolanynull to true */
         EmitStoreToArray(Jitcc, v_boolanynullp, 0, jit::imm(1), sizeof(bool));
-        Jitcc.jmp(L_BoolCont);
+        EmitJump(Jitcc, L_BoolCont);
       }
 
       Jitcc.bind(L_BoolCheckTrue);
       {
-        Jitcc.cmp(v_boolvalue, jit::imm(1));
-        Jitcc.jne(L_BoolCont);
+        EmitCondJumpNE(Jitcc, v_boolvalue, 1, L_BoolCont);
 
         /* b_boolistrue */
-        /* result is already set to FALSE, need not change it */
-        /* and jump to the end of the AND expression */
-        Jitcc.jmp(L_opblocks[op->d.boolexpr.jumpdone]);
+        EmitJump(Jitcc, L_opblocks[op->d.boolexpr.jumpdone]);
       }
 
       Jitcc.bind(L_BoolCont);
       {
-        x86::Gp v_boolanynull = Jitcc.newInt8("v_boolanynull.i8");
+        arch::Gp v_boolanynull = Jitcc.new_gp32("v_boolanynull");
         EmitLoadFromArray(Jitcc, v_boolanynullp, 0, v_boolanynull,
                           sizeof(bool));
-        Jitcc.cmp(v_boolanynull, jit::imm(0));
-        Jitcc.je(L_opblocks[opno + 1]);
+        EmitCondJumpEQ(Jitcc, v_boolanynull, 0, L_opblocks[opno + 1]);
       }
 
       /* set resnull to true */
@@ -615,40 +589,35 @@ bool AsmJitCompileExpr(ExprState *State) {
     }
 
     case EEOP_BOOL_NOT_STEP: {
-      x86::Gp v_resvaluep =
-          EmitLoadConstUIntPtr(Jitcc, "v_resvaluep.uintptr", op->resvalue);
-      x86::Gp v_boolvalue = Jitcc.newUIntPtr("v_boolvalue.uintptr"),
-              v_negbool = Jitcc.newUIntPtr("v_negbool.uintptr");
+      arch::Gp v_resvaluep =
+          EmitLoadConstUIntPtr(Jitcc, "v_resvaluep", op->resvalue);
+      arch::Gp v_boolvalue = Jitcc.new_gp_ptr("v_boolvalue");
+      arch::Gp v_negbool = Jitcc.new_gp_ptr("v_negbool");
 
       EmitLoadFromArray(Jitcc, v_resvaluep, 0, v_boolvalue, sizeof(Datum));
-      Jitcc.xor_(v_negbool, v_negbool);
-      Jitcc.cmp(v_boolvalue, jit::imm(0));
-      Jitcc.sete(v_negbool);
+      EmitSetEQ(Jitcc, v_negbool, v_boolvalue, 0);
 
       EmitStoreToArray(Jitcc, v_resvaluep, 0, v_negbool, sizeof(Datum));
       break;
     }
 
     case EEOP_QUAL: {
-      jit::Label L_HandleNullOrFalse = Jitcc.newLabel();
+      jit::Label L_HandleNullOrFalse = Jitcc.new_label();
 
-      x86::Gp v_resvaluep = EmitLoadConstUIntPtr(Jitcc, "v_resvaluep.uintptr",
-                                                 op->resvalue),
-              v_resnullp = EmitLoadConstUIntPtr(Jitcc, "v_resnullp.uintptr",
-                                                op->resnull);
-      x86::Gp v_resvalue = Jitcc.newUIntPtr("v_resvalue.uintptr"),
-              v_resnull = Jitcc.newInt8("v_resnull.i8");
+      arch::Gp v_resvaluep =
+                  EmitLoadConstUIntPtr(Jitcc, "v_resvaluep", op->resvalue),
+               v_resnullp =
+                   EmitLoadConstUIntPtr(Jitcc, "v_resnullp", op->resnull);
+      arch::Gp v_resvalue = Jitcc.new_gp_ptr("v_resvalue"),
+               v_resnull = Jitcc.new_gp32("v_resnull");
 
       EmitLoadFromArray(Jitcc, v_resvaluep, 0, v_resvalue, sizeof(Datum));
       EmitLoadFromArray(Jitcc, v_resnullp, 0, v_resnull, sizeof(bool));
 
-      Jitcc.cmp(v_resnull, jit::imm(1));
-      Jitcc.je(L_HandleNullOrFalse);
+      EmitCondJumpEQ(Jitcc, v_resnull, 1, L_HandleNullOrFalse);
+      EmitCondJumpEQ(Jitcc, v_resvalue, 0, L_HandleNullOrFalse);
 
-      Jitcc.cmp(v_resvalue, jit::imm(0));
-      Jitcc.je(L_HandleNullOrFalse);
-
-      Jitcc.jmp(L_opblocks[opno + 1]);
+      EmitJump(Jitcc, L_opblocks[opno + 1]);
 
       /* Handling null or false. */
       Jitcc.bind(L_HandleNullOrFalse);
@@ -657,76 +626,68 @@ bool AsmJitCompileExpr(ExprState *State) {
       EmitStoreToArray(Jitcc, v_resvaluep, 0, jit::imm(0), sizeof(Datum));
       EmitStoreToArray(Jitcc, v_resnullp, 0, jit::imm(0), sizeof(bool));
 
-      Jitcc.jmp(L_opblocks[op->d.qualexpr.jumpdone]);
+      EmitJump(Jitcc, L_opblocks[op->d.qualexpr.jumpdone]);
 
       break;
     }
 
     case EEOP_JUMP: {
-      Jitcc.jmp(L_opblocks[op->d.jump.jumpdone]);
+      EmitJump(Jitcc, L_opblocks[op->d.jump.jumpdone]);
       break;
     }
 
     case EEOP_JUMP_IF_NULL: {
       /* Transfer control if current result is null */
-      x86::Gp v_resnullp =
-          EmitLoadConstUIntPtr(Jitcc, "v_resnullp.uintptr", op->resnull);
-      x86::Gp v_resnull = Jitcc.newInt8("v_resnull.i8");
+      arch::Gp v_resnullp =
+          EmitLoadConstUIntPtr(Jitcc, "v_resnullp", op->resnull);
+      arch::Gp v_resnull = Jitcc.new_gp32("v_resnull");
 
       EmitLoadFromArray(Jitcc, v_resnullp, 0, v_resnull, sizeof(bool));
-
-      Jitcc.cmp(v_resnull, jit::imm(1));
-      Jitcc.je(L_opblocks[op->d.jump.jumpdone]);
+      EmitCondJumpEQ(Jitcc, v_resnull, 1, L_opblocks[op->d.jump.jumpdone]);
 
       break;
     }
 
     case EEOP_JUMP_IF_NOT_NULL: {
       /* Transfer control if current result is non-null */
-      x86::Gp v_resnullp =
-          EmitLoadConstUIntPtr(Jitcc, "v_resnullp.uintptr", op->resnull);
-      x86::Gp v_resnull = Jitcc.newInt8("v_resnull.i8");
+      arch::Gp v_resnullp =
+          EmitLoadConstUIntPtr(Jitcc, "v_resnullp", op->resnull);
+      arch::Gp v_resnull = Jitcc.new_gp32("v_resnull");
 
       EmitLoadFromArray(Jitcc, v_resnullp, 0, v_resnull, sizeof(bool));
-
-      Jitcc.cmp(v_resnull, jit::imm(0));
-      Jitcc.je(L_opblocks[op->d.jump.jumpdone]);
+      EmitCondJumpEQ(Jitcc, v_resnull, 0, L_opblocks[op->d.jump.jumpdone]);
 
       break;
     }
 
     case EEOP_JUMP_IF_NOT_TRUE: {
-      x86::Gp v_resvaluep = EmitLoadConstUIntPtr(Jitcc, "v_resvaluep.uintptr",
-                                                 op->resvalue),
-              v_resnullp = EmitLoadConstUIntPtr(Jitcc, "v_resnullp.uintptr",
-                                                op->resnull);
-      x86::Gp v_resvalue = Jitcc.newUIntPtr("v_resvalue.uintptr"),
-              v_resnull = Jitcc.newInt8("v_resnull.i8");
+      arch::Gp v_resvaluep =
+                  EmitLoadConstUIntPtr(Jitcc, "v_resvaluep", op->resvalue),
+               v_resnullp =
+                   EmitLoadConstUIntPtr(Jitcc, "v_resnullp", op->resnull);
+      arch::Gp v_resvalue = Jitcc.new_gp_ptr("v_resvalue"),
+               v_resnull = Jitcc.new_gp32("v_resnull");
 
       EmitLoadFromArray(Jitcc, v_resvaluep, 0, v_resvalue, sizeof(Datum));
       EmitLoadFromArray(Jitcc, v_resnullp, 0, v_resnull, sizeof(bool));
 
       /* Transfer control if current result is null or false */
-      Jitcc.cmp(v_resnull, jit::imm(1));
-      Jitcc.je(L_opblocks[op->d.jump.jumpdone]);
-      Jitcc.cmp(v_resvalue, jit::imm(0));
-      Jitcc.je(L_opblocks[op->d.jump.jumpdone]);
+      EmitCondJumpEQ(Jitcc, v_resnull, 1, L_opblocks[op->d.jump.jumpdone]);
+      EmitCondJumpEQ(Jitcc, v_resvalue, 0, L_opblocks[op->d.jump.jumpdone]);
 
       break;
     }
 
     case EEOP_NULLTEST_ISNULL: {
-      x86::Gp v_resvaluep = EmitLoadConstUIntPtr(Jitcc, "v_resvaluep.uintptr",
-                                                 op->resvalue),
-              v_resnullp = EmitLoadConstUIntPtr(Jitcc, "v_resnullp.uintptr",
-                                                op->resnull);
-      x86::Gp v_resvalue = Jitcc.newUIntPtr("v_resvalue.uintptr"),
-              v_resnull = Jitcc.newInt8("v_resnull.i8");
+      arch::Gp v_resvaluep =
+                  EmitLoadConstUIntPtr(Jitcc, "v_resvaluep", op->resvalue),
+               v_resnullp =
+                   EmitLoadConstUIntPtr(Jitcc, "v_resnullp", op->resnull);
+      arch::Gp v_resvalue = Jitcc.new_gp_ptr("v_resvalue"),
+               v_resnull = Jitcc.new_gp32("v_resnull");
 
       EmitLoadFromArray(Jitcc, v_resnullp, 0, v_resnull, sizeof(bool));
-      Jitcc.xor_(v_resvalue, v_resvalue);
-      Jitcc.cmp(v_resnull, jit::imm(1));
-      Jitcc.sete(v_resvalue);
+      EmitSetEQ(Jitcc, v_resvalue, v_resnull, 1);
       EmitStoreToArray(Jitcc, v_resvaluep, 0, v_resvalue, sizeof(Datum));
       EmitStoreToArray(Jitcc, v_resnullp, 0, jit::imm(0), sizeof(bool));
 
@@ -734,17 +695,15 @@ bool AsmJitCompileExpr(ExprState *State) {
     }
 
     case EEOP_NULLTEST_ISNOTNULL: {
-      x86::Gp v_resvaluep = EmitLoadConstUIntPtr(Jitcc, "v_resvaluep.uintptr",
-                                                 op->resvalue),
-              v_resnullp = EmitLoadConstUIntPtr(Jitcc, "v_resnullp.uintptr",
-                                                op->resnull);
-      x86::Gp v_resvalue = Jitcc.newUIntPtr("v_resvalue.uintptr"),
-              v_resnull = Jitcc.newInt8("v_resnull.i8");
+      arch::Gp v_resvaluep =
+                  EmitLoadConstUIntPtr(Jitcc, "v_resvaluep", op->resvalue),
+               v_resnullp =
+                   EmitLoadConstUIntPtr(Jitcc, "v_resnullp", op->resnull);
+      arch::Gp v_resvalue = Jitcc.new_gp_ptr("v_resvalue"),
+               v_resnull = Jitcc.new_gp32("v_resnull");
 
       EmitLoadFromArray(Jitcc, v_resnullp, 0, v_resnull, sizeof(bool));
-      Jitcc.xor_(v_resvalue, v_resvalue);
-      Jitcc.cmp(v_resnull, jit::imm(0));
-      Jitcc.sete(v_resvalue);
+      EmitSetEQ(Jitcc, v_resvalue, v_resnull, 0);
 
       EmitStoreToArray(Jitcc, v_resvaluep, 0, v_resvalue, sizeof(Datum));
       EmitStoreToArray(Jitcc, v_resnullp, 0, jit::imm(0), sizeof(bool));
@@ -766,17 +725,16 @@ bool AsmJitCompileExpr(ExprState *State) {
     case EEOP_BOOLTEST_IS_NOT_FALSE:
     case EEOP_BOOLTEST_IS_FALSE:
     case EEOP_BOOLTEST_IS_NOT_TRUE: {
-      jit::Label L_NotNull = Jitcc.newLabel();
-      x86::Gp v_resvaluep = EmitLoadConstUIntPtr(Jitcc, "v_resvaluep.uintptr",
-                                                 op->resvalue),
-              v_resnullp = EmitLoadConstUIntPtr(Jitcc, "v_resnullp.uintptr",
-                                                op->resnull);
-      x86::Gp v_resnull = Jitcc.newInt8("resnull.i8");
+      jit::Label L_NotNull = Jitcc.new_label();
+      arch::Gp v_resvaluep =
+                  EmitLoadConstUIntPtr(Jitcc, "v_resvaluep", op->resvalue),
+               v_resnullp =
+                   EmitLoadConstUIntPtr(Jitcc, "v_resnullp", op->resnull);
+      arch::Gp v_resnull = Jitcc.new_gp32("resnull");
 
       EmitLoadFromArray(Jitcc, v_resnullp, 0, v_resnull, sizeof(bool));
-      Jitcc.cmp(v_resnull, jit::imm(1));
-      Jitcc.jne(L_NotNull);
-      /* result is not null. */
+      EmitCondJumpNE(Jitcc, v_resnull, 1, L_NotNull);
+      /* result is null. */
       EmitStoreToArray(Jitcc, v_resnullp, 0, jit::imm(0), sizeof(bool));
       EmitStoreToArray(
           Jitcc, v_resvaluep, 0,
@@ -784,7 +742,7 @@ bool AsmJitCompileExpr(ExprState *State) {
               ? jit::imm(0)
               : jit::imm(1),
           sizeof(Datum));
-      Jitcc.jmp(L_opblocks[opno + 1]);
+      EmitJump(Jitcc, L_opblocks[opno + 1]);
 
       Jitcc.bind(L_NotNull);
       if (opcode == EEOP_BOOLTEST_IS_TRUE ||
@@ -794,13 +752,10 @@ bool AsmJitCompileExpr(ExprState *State) {
          * set)
          */
       } else {
-        x86::Gp v_resvalue = Jitcc.newUIntPtr("v_resvalue.uintptr");
-        x86::Gp v_resvalue_is_false =
-            Jitcc.newUIntPtr("v_resvalue_is_false.uintptr");
+        arch::Gp v_resvalue = Jitcc.new_gp_ptr("v_resvalue");
+        arch::Gp v_resvalue_is_false = Jitcc.new_gp_ptr("v_resvalue_is_false");
         EmitLoadFromArray(Jitcc, v_resvaluep, 0, v_resvalue, sizeof(Datum));
-        Jitcc.xor_(v_resvalue_is_false, v_resvalue_is_false);
-        Jitcc.cmp(v_resvalue, jit::imm(0));
-        Jitcc.sete(v_resvalue_is_false);
+        EmitSetEQ(Jitcc, v_resvalue_is_false, v_resvalue, 0);
         EmitStoreToArray(Jitcc, v_resvaluep, 0, v_resvalue_is_false,
                          sizeof(Datum));
       }
@@ -830,18 +785,18 @@ bool AsmJitCompileExpr(ExprState *State) {
 
     case EEOP_SBSREF_SUBSCRIPTS: {
       jit::InvokeNode *InvokeSubscriptFunc;
-      x86::Gp v_retval = Jitcc.newInt8("ret.i8");
-      Jitcc.invoke(
-          &InvokeSubscriptFunc, jit::imm(op->d.sbsref_subscript.subscriptfunc),
+      arch::Gp v_retval = Jitcc.new_gp32("ret");
+      Jitcc.invoke(asmjit::Out(InvokeSubscriptFunc),
+           JIT_FN_PTR(Jitcc, op->d.sbsref_subscript.subscriptfunc),
           jit::FuncSignature::build<bool, ExprState *, struct ExprEvalStep *,
                                     ExprContext *>());
-      InvokeSubscriptFunc->setArg(0, v_state);
-      InvokeSubscriptFunc->setArg(1, jit::imm(op));
-      InvokeSubscriptFunc->setArg(2, v_econtext);
-      InvokeSubscriptFunc->setRet(0, v_retval);
+      InvokeSubscriptFunc->set_arg(0, v_state);
+      InvokeSubscriptFunc->set_arg(1, jit::imm(op));
+      InvokeSubscriptFunc->set_arg(2, v_econtext);
+      InvokeSubscriptFunc->set_ret(0, v_retval);
 
-      Jitcc.cmp(v_retval, jit::imm(0));
-      Jitcc.je(L_opblocks[op->d.sbsref_subscript.jumpdone]);
+      EmitCondJumpEQ(Jitcc, v_retval, 0,
+                     L_opblocks[op->d.sbsref_subscript.jumpdone]);
       break;
     }
 
@@ -853,26 +808,26 @@ bool AsmJitCompileExpr(ExprState *State) {
     }
 
     case EEOP_CASE_TESTVAL: {
-      x86::Gp v_resvaluep = EmitLoadConstUIntPtr(Jitcc, "v_resvaluep.uintptr",
-                                                 op->resvalue),
-              v_resnullp = EmitLoadConstUIntPtr(Jitcc, "v_resnullp.uintptr",
-                                                op->resnull);
+      arch::Gp v_resvaluep =
+                  EmitLoadConstUIntPtr(Jitcc, "v_resvaluep", op->resvalue),
+               v_resnullp =
+                   EmitLoadConstUIntPtr(Jitcc, "v_resnullp", op->resnull);
       if (op->d.casetest.value) {
-        x86::Gp v_casevaluep = EmitLoadConstUIntPtr(
-                    Jitcc, "v_casevaluep.uintptr", op->d.casetest.value),
-                v_casenullp = EmitLoadConstUIntPtr(Jitcc, "v_casenullp.uintptr",
-                                                   op->d.casetest.isnull);
-        x86::Gp v_casevalue = Jitcc.newUIntPtr("v_casevalue.uintptr"),
-                v_casenull = Jitcc.newInt8("v_casenull.i8");
+        arch::Gp v_casevaluep = EmitLoadConstUIntPtr(
+                    Jitcc, "v_casevaluep", op->d.casetest.value),
+                 v_casenullp = EmitLoadConstUIntPtr(Jitcc, "v_casenullp",
+                                                    op->d.casetest.isnull);
+        arch::Gp v_casevalue = Jitcc.new_gp_ptr("v_casevalue"),
+                 v_casenull = Jitcc.new_gp32("v_casenull");
         EmitLoadFromArray(Jitcc, v_casevaluep, 0, v_casevalue, sizeof(Datum));
         EmitLoadFromArray(Jitcc, v_casenullp, 0, v_casenull, sizeof(bool));
 
         EmitStoreToArray(Jitcc, v_resvaluep, 0, v_casevalue, sizeof(Datum));
         EmitStoreToArray(Jitcc, v_resnullp, 0, v_casenull, sizeof(bool));
       } else {
-        x86::Gp v_casevalue =
+        arch::Gp v_casevalue =
             emit_load_caseValue_datum_from_ExprContext(Jitcc, v_econtext);
-        x86::Gp v_casenull =
+        arch::Gp v_casenull =
             emit_load_caseValue_isNull_from_ExprContext(Jitcc, v_econtext);
 
         EmitStoreToArray(Jitcc, v_resvaluep, 0, v_casevalue, sizeof(Datum));
@@ -881,34 +836,33 @@ bool AsmJitCompileExpr(ExprState *State) {
       break;
     }
     case EEOP_MAKE_READONLY: {
-      x86::Gp v_nullp = EmitLoadConstUIntPtr(Jitcc, "v_nullp.uintptr",
-                                             op->d.make_readonly.isnull);
-      x86::Gp v_null = Jitcc.newInt8("v_null.i8");
+      arch::Gp v_nullp =
+          EmitLoadConstUIntPtr(Jitcc, "v_nullp", op->d.make_readonly.isnull);
+      arch::Gp v_null = Jitcc.new_gp32("v_null");
 
       EmitLoadFromArray(Jitcc, v_nullp, 0, v_null, sizeof(bool));
 
       /* store null isnull value in result */
-      x86::Gp v_resnullp =
-          EmitLoadConstUIntPtr(Jitcc, "v_resnullp.uintptr", op->resnull);
+      arch::Gp v_resnullp =
+          EmitLoadConstUIntPtr(Jitcc, "v_resnullp", op->resnull);
       EmitStoreToArray(Jitcc, v_resnullp, 0, v_null, sizeof(bool));
 
-      Jitcc.cmp(v_null, jit::imm(1));
-      Jitcc.je(L_opblocks[opno + 1]);
+      EmitCondJumpEQ(Jitcc, v_null, 1, L_opblocks[opno + 1]);
 
       /* if value is not null, convert to RO datum */
-      x86::Gp v_valuep = EmitLoadConstUIntPtr(Jitcc, "v_valuep.uintptr",
-                                              op->d.make_readonly.value);
-      x86::Gp v_value = Jitcc.newUIntPtr("v_value.uintptr");
+      arch::Gp v_valuep =
+          EmitLoadConstUIntPtr(Jitcc, "v_valuep", op->d.make_readonly.value);
+      arch::Gp v_value = Jitcc.new_gp_ptr("v_value");
       EmitLoadFromArray(Jitcc, v_valuep, 0, v_value, sizeof(Datum));
       jit::InvokeNode *InvokeMakeExpandedObjectReadOnly;
-      Jitcc.invoke(&InvokeMakeExpandedObjectReadOnly,
-                   jit::imm(MakeExpandedObjectReadOnlyInternal),
+      Jitcc.invoke(asmjit::Out(InvokeMakeExpandedObjectReadOnly),
+                   JIT_FN_PTR(Jitcc, MakeExpandedObjectReadOnlyInternal),
                    jit::FuncSignature::build<Datum, Datum>());
-      InvokeMakeExpandedObjectReadOnly->setArg(0, v_value);
-      InvokeMakeExpandedObjectReadOnly->setRet(0, v_value);
+      InvokeMakeExpandedObjectReadOnly->set_arg(0, v_value);
+      InvokeMakeExpandedObjectReadOnly->set_ret(0, v_value);
 
-      x86::Gp v_resvaluep =
-          EmitLoadConstUIntPtr(Jitcc, "v_resvaluep.uintptr", op->resvalue);
+      arch::Gp v_resvaluep =
+          EmitLoadConstUIntPtr(Jitcc, "v_resvaluep", op->resvalue);
       EmitStoreToArray(Jitcc, v_resvaluep, 0, v_value, sizeof(Datum));
       break;
     }
@@ -916,27 +870,26 @@ bool AsmJitCompileExpr(ExprState *State) {
     case EEOP_IOCOERCE: {
       FunctionCallInfo fcinfo_out = op->d.iocoerce.fcinfo_data_out,
                        fcinfo_in = op->d.iocoerce.fcinfo_data_in;
-      jit::Label L_SkipOutputCall = Jitcc.newLabel(),
-                 L_InputCall = Jitcc.newLabel();
+      jit::Label L_SkipOutputCall = Jitcc.new_label(),
+                 L_InputCall = Jitcc.new_label();
 
-      x86::Gp v_fcinfo_out = EmitLoadConstUIntPtr(Jitcc, "v_fcinfo_out.uintptr",
-                                                  fcinfo_out),
-              v_fcinfo_in =
-                  EmitLoadConstUIntPtr(Jitcc, "v_fcinfo_in.uintptr", fcinfo_in);
-      x86::Gp v_output = Jitcc.newUInt64("v_output.u64");
+      arch::Gp v_fcinfo_out =
+                  EmitLoadConstUIntPtr(Jitcc, "v_fcinfo_out", fcinfo_out),
+               v_fcinfo_in =
+                   EmitLoadConstUIntPtr(Jitcc, "v_fcinfo_in", fcinfo_in);
+      arch::Gp v_output = Jitcc.new_gp64("v_output");
 
-      x86::Gp v_resnullp =
-          EmitLoadConstUIntPtr(Jitcc, "op.resnullp.uintptr", op->resnull);
-      x86::Gp v_resnull = Jitcc.newInt8("op.resnull.i8");
+      arch::Gp v_resnullp =
+          EmitLoadConstUIntPtr(Jitcc, "op.resnullp", op->resnull);
+      arch::Gp v_resnull = Jitcc.new_gp32("op.resnull");
       EmitLoadFromArray(Jitcc, v_resnullp, 0, v_resnull, sizeof(bool));
 
-      Jitcc.cmp(v_resnull, jit::imm(1));
-      Jitcc.je(L_SkipOutputCall);
+      EmitCondJumpEQ(Jitcc, v_resnull, 1, L_SkipOutputCall);
       {
         /* Not null, call output. */
-        x86::Gp v_resvaluep =
-            EmitLoadConstUIntPtr(Jitcc, "op.resvalue.uintptr", op->resvalue);
-        x86::Gp v_resvalue = Jitcc.newUIntPtr("v_resvalue");
+        arch::Gp v_resvaluep =
+            EmitLoadConstUIntPtr(Jitcc, "op.resvalue", op->resvalue);
+        arch::Gp v_resvalue = Jitcc.new_gp_ptr("v_resvalue");
         EmitLoadFromArray(Jitcc, v_resvaluep, 0, v_resvalue, sizeof(Datum));
         StoreFuncArgValue(Jitcc, v_fcinfo_out, 0, v_resvalue);
         StoreFuncArgNull(Jitcc, v_fcinfo_out, 0, jit::imm(0));
@@ -944,11 +897,11 @@ bool AsmJitCompileExpr(ExprState *State) {
                                                       jit::imm(0));
 
         jit::InvokeNode *PGFunc;
-        Jitcc.invoke(&PGFunc, jit::imm(fcinfo_out->flinfo->fn_addr),
+        Jitcc.invoke(asmjit::Out(PGFunc), JIT_FN_PTR(Jitcc, fcinfo_out->flinfo->fn_addr),
                      jit::FuncSignature::build<Datum, FunctionCallInfo>());
-        PGFunc->setArg(0, v_fcinfo_out);
-        PGFunc->setRet(0, v_output);
-        Jitcc.jmp(L_InputCall);
+        PGFunc->set_arg(0, v_fcinfo_out);
+        PGFunc->set_ret(0, v_output);
+        EmitJump(Jitcc, L_InputCall);
       }
 
       Jitcc.bind(L_SkipOutputCall);
@@ -957,8 +910,7 @@ bool AsmJitCompileExpr(ExprState *State) {
       Jitcc.bind(L_InputCall);
       {
         if (op->d.iocoerce.finfo_in->fn_strict) {
-          Jitcc.cmp(v_output, jit::imm(0));
-          Jitcc.je(L_opblocks[opno + 1]);
+          EmitCondJumpEQ(Jitcc, v_output, 0, L_opblocks[opno + 1]);
         }
         EmitLoadFromArray(Jitcc, v_resnullp, 0, v_resnull, sizeof(bool));
         /* Call input function. */
@@ -967,13 +919,13 @@ bool AsmJitCompileExpr(ExprState *State) {
         emit_store_isnull_to_FunctionCallInfoBaseData(Jitcc, v_fcinfo_in,
                                                       jit::imm(0));
         jit::InvokeNode *PGFunc;
-        Jitcc.invoke(&PGFunc, jit::imm(fcinfo_in->flinfo->fn_addr),
+        Jitcc.invoke(asmjit::Out(PGFunc), JIT_FN_PTR(Jitcc, fcinfo_in->flinfo->fn_addr),
                      jit::FuncSignature::build<Datum, FunctionCallInfo>());
-        PGFunc->setArg(0, v_fcinfo_in);
-        PGFunc->setRet(0, v_output);
+        PGFunc->set_arg(0, v_fcinfo_in);
+        PGFunc->set_ret(0, v_output);
 
-        x86::Gp v_resvaluep =
-            EmitLoadConstUIntPtr(Jitcc, "op.resvalue.uintptr", op->resvalue);
+        arch::Gp v_resvaluep =
+            EmitLoadConstUIntPtr(Jitcc, "op.resvalue", op->resvalue);
         EmitStoreToArray(Jitcc, v_resvaluep, 0, v_output, sizeof(Datum));
       }
       break;
@@ -987,76 +939,71 @@ bool AsmJitCompileExpr(ExprState *State) {
     case EEOP_DISTINCT:
     case EEOP_NOT_DISTINCT: {
       FunctionCallInfo fcinfo = op->d.func.fcinfo_data;
-      jit::Label L_NoArgIsNull = Jitcc.newLabel(),
-                 L_AnyArgIsNull = Jitcc.newLabel();
-      x86::Gp v_fcinfo =
-          EmitLoadConstUIntPtr(Jitcc, "v_fcinfo.uintptr", fcinfo);
+      jit::Label L_NoArgIsNull = Jitcc.new_label(),
+                 L_AnyArgIsNull = Jitcc.new_label();
+      arch::Gp v_fcinfo = EmitLoadConstUIntPtr(Jitcc, "v_fcinfo", fcinfo);
       /* load args[0|1].isnull for both arguments */
-      x86::Gp v_argnull0 = LoadFuncArgNull(Jitcc, v_fcinfo, 0),
-              v_argnull1 = LoadFuncArgNull(Jitcc, v_fcinfo, 1);
-      x86::Gp v_anyargisnull = Jitcc.newInt8("v_anyargisnull.i8");
+      arch::Gp v_argnull0 = LoadFuncArgNull(Jitcc, v_fcinfo, 0),
+               v_argnull1 = LoadFuncArgNull(Jitcc, v_fcinfo, 1);
+      arch::Gp v_anyargisnull = Jitcc.new_gp32("v_anyargisnull");
       Jitcc.mov(v_anyargisnull, v_argnull0);
-      Jitcc.or_(v_anyargisnull, v_argnull1);
+      EmitBitwiseOr(Jitcc, v_anyargisnull, v_argnull1);
 
-      Jitcc.cmp(v_anyargisnull, jit::imm(0));
-      Jitcc.je(L_NoArgIsNull);
+      EmitCondJumpEQ(Jitcc, v_anyargisnull, 0, L_NoArgIsNull);
       {
         /* check both arguments */
-        x86::Gp v_bothargisnull = Jitcc.newInt8("v_bothargisnull.i8");
+        arch::Gp v_bothargisnull = Jitcc.new_gp32("v_bothargisnull");
         Jitcc.mov(v_bothargisnull, v_argnull0);
-        Jitcc.and_(v_bothargisnull, v_argnull1);
-        Jitcc.cmp(v_bothargisnull, jit::imm(1));
-        Jitcc.jne(L_AnyArgIsNull);
+        EmitBitwiseAnd(Jitcc, v_bothargisnull, v_argnull1);
+        EmitCondJumpNE(Jitcc, v_bothargisnull, 1, L_AnyArgIsNull);
         {
-          x86::Gp v_resnullp =
-              EmitLoadConstUIntPtr(Jitcc, "op.resnullp.uintptr", op->resnull);
-          x86::Gp v_resvaluep =
-              EmitLoadConstUIntPtr(Jitcc, "op.resvaluep.uintptr", op->resvalue);
+          arch::Gp v_resnullp =
+              EmitLoadConstUIntPtr(Jitcc, "op.resnullp", op->resnull);
+          arch::Gp v_resvaluep =
+              EmitLoadConstUIntPtr(Jitcc, "op.resvaluep", op->resvalue);
           EmitStoreToArray(Jitcc, v_resnullp, 0, jit::imm(0), sizeof(bool));
           if (opcode == EEOP_NOT_DISTINCT)
             EmitStoreToArray(Jitcc, v_resvaluep, 0, jit::imm(1), sizeof(Datum));
           else
             EmitStoreToArray(Jitcc, v_resvaluep, 0, jit::imm(0), sizeof(Datum));
-          Jitcc.jmp(L_opblocks[opno + 1]);
+          EmitJump(Jitcc, L_opblocks[opno + 1]);
         }
 
         Jitcc.bind(L_AnyArgIsNull);
         {
-          x86::Gp v_resnullp =
-              EmitLoadConstUIntPtr(Jitcc, "op.resnullp.uintptr", op->resnull);
-          x86::Gp v_resvaluep =
-              EmitLoadConstUIntPtr(Jitcc, "op.resvaluep.uintptr", op->resvalue);
+          arch::Gp v_resnullp =
+              EmitLoadConstUIntPtr(Jitcc, "op.resnullp", op->resnull);
+          arch::Gp v_resvaluep =
+              EmitLoadConstUIntPtr(Jitcc, "op.resvaluep", op->resvalue);
           EmitStoreToArray(Jitcc, v_resnullp, 0, jit::imm(0), sizeof(bool));
           if (opcode == EEOP_NOT_DISTINCT)
             EmitStoreToArray(Jitcc, v_resvaluep, 0, jit::imm(0), sizeof(Datum));
           else
             EmitStoreToArray(Jitcc, v_resvaluep, 0, jit::imm(1), sizeof(Datum));
-          Jitcc.jmp(L_opblocks[opno + 1]);
+          EmitJump(Jitcc, L_opblocks[opno + 1]);
         }
       }
 
       Jitcc.bind(L_NoArgIsNull);
       {
-        x86::Gp v_retval = Jitcc.newUInt64("v_retval.u64");
+        arch::Gp v_retval = Jitcc.new_gp64("v_retval");
         jit::InvokeNode *PGFunc;
-        Jitcc.invoke(&PGFunc, jit::imm(fcinfo->flinfo->fn_addr),
+        Jitcc.invoke(asmjit::Out(PGFunc), JIT_FN_PTR(Jitcc, fcinfo->flinfo->fn_addr),
                      jit::FuncSignature::build<Datum, FunctionCallInfo>());
-        PGFunc->setArg(0, v_fcinfo);
-        PGFunc->setRet(0, v_retval);
-        x86::Gp v_fcinfo_isnull =
+        PGFunc->set_arg(0, v_fcinfo);
+        PGFunc->set_ret(0, v_retval);
+        arch::Gp v_fcinfo_isnull =
             emit_load_isnull_from_FunctionCallInfoBaseData(Jitcc, v_fcinfo);
         if (opcode == EEOP_DISTINCT) {
           /* Must invert the result of "=" */
-          x86::Gp v_tmpretval = Jitcc.newUInt64("v_tmpretval.u64");
+          arch::Gp v_tmpretval = Jitcc.new_gp64("v_tmpretval");
           Jitcc.mov(v_tmpretval, v_retval);
-          Jitcc.xor_(v_retval, v_retval);
-          Jitcc.cmp(v_tmpretval, jit::imm(0));
-          Jitcc.sete(v_retval);
+          EmitSetEQ(Jitcc, v_retval, v_tmpretval, 0);
         }
-        x86::Gp v_resnullp =
-            EmitLoadConstUIntPtr(Jitcc, "op.resnullp.uintptr", op->resnull);
-        x86::Gp v_resvaluep =
-            EmitLoadConstUIntPtr(Jitcc, "op.resvaluep.uintptr", op->resvalue);
+        arch::Gp v_resnullp =
+            EmitLoadConstUIntPtr(Jitcc, "op.resnullp", op->resnull);
+        arch::Gp v_resvaluep =
+            EmitLoadConstUIntPtr(Jitcc, "op.resvaluep", op->resvalue);
 
         EmitStoreToArray(Jitcc, v_resnullp, 0, v_fcinfo_isnull, sizeof(bool));
         EmitStoreToArray(Jitcc, v_resvaluep, 0, v_retval, sizeof(Datum));
@@ -1066,40 +1013,38 @@ bool AsmJitCompileExpr(ExprState *State) {
 
     case EEOP_NULLIF: {
       FunctionCallInfo fcinfo = op->d.func.fcinfo_data;
-      jit::Label L_NonNull = Jitcc.newLabel(), L_HasNull = Jitcc.newLabel();
-      x86::Gp v_fcinfo =
-          EmitLoadConstUIntPtr(Jitcc, "v_fcinfo.uintptr", fcinfo);
+      jit::Label L_NonNull = Jitcc.new_label(), L_HasNull = Jitcc.new_label();
+      arch::Gp v_fcinfo = EmitLoadConstUIntPtr(Jitcc, "v_fcinfo", fcinfo);
 
       /* if either argument is NULL they can't be equal */
-      x86::Gp v_argnull0 = LoadFuncArgNull(Jitcc, v_fcinfo, 0);
-      x86::Gp v_argnull1 = LoadFuncArgNull(Jitcc, v_fcinfo, 1);
-      x86::Gp v_anyargisnull = Jitcc.newInt8("v_anyargisnull.i8");
+      arch::Gp v_argnull0 = LoadFuncArgNull(Jitcc, v_fcinfo, 0);
+      arch::Gp v_argnull1 = LoadFuncArgNull(Jitcc, v_fcinfo, 1);
+      arch::Gp v_anyargisnull = Jitcc.new_gp32("v_anyargisnull");
       Jitcc.mov(v_anyargisnull, v_argnull0);
-      Jitcc.or_(v_anyargisnull, v_argnull1);
+      EmitBitwiseOr(Jitcc, v_anyargisnull, v_argnull1);
 
-      Jitcc.cmp(v_anyargisnull, jit::imm(1));
-      Jitcc.jne(L_NonNull);
+      EmitCondJumpNE(Jitcc, v_anyargisnull, 1, L_NonNull);
       Jitcc.bind(L_HasNull);
       {
-        x86::Gp v_arg0 = LoadFuncArgValue(Jitcc, v_fcinfo, 0);
-        x86::Gp v_resnullp =
-            EmitLoadConstUIntPtr(Jitcc, "op.resnullp.uintptr", op->resnull);
-        x86::Gp v_resvaluep =
-            EmitLoadConstUIntPtr(Jitcc, "op.resvaluep.uintptr", op->resvalue);
+        arch::Gp v_arg0 = LoadFuncArgValue(Jitcc, v_fcinfo, 0);
+        arch::Gp v_resnullp =
+            EmitLoadConstUIntPtr(Jitcc, "op.resnullp", op->resnull);
+        arch::Gp v_resvaluep =
+            EmitLoadConstUIntPtr(Jitcc, "op.resvaluep", op->resvalue);
         EmitStoreToArray(Jitcc, v_resnullp, 0, v_argnull0, sizeof(bool));
         EmitStoreToArray(Jitcc, v_resvaluep, 0, v_arg0, sizeof(Datum));
-        Jitcc.jmp(L_opblocks[opno + 1]);
+        EmitJump(Jitcc, L_opblocks[opno + 1]);
       }
 
       Jitcc.bind(L_NonNull);
       {
-        x86::Gp v_retval = Jitcc.newUInt64("v_retval.u64");
+        arch::Gp v_retval = Jitcc.new_gp64("v_retval");
         jit::InvokeNode *PGFunc;
-        Jitcc.invoke(&PGFunc, jit::imm(fcinfo->flinfo->fn_addr),
+        Jitcc.invoke(asmjit::Out(PGFunc), JIT_FN_PTR(Jitcc, fcinfo->flinfo->fn_addr),
                      jit::FuncSignature::build<Datum, FunctionCallInfo>());
-        PGFunc->setArg(0, v_fcinfo);
-        PGFunc->setRet(0, v_retval);
-        x86::Gp v_fcinfo_isnull =
+        PGFunc->set_arg(0, v_fcinfo);
+        PGFunc->set_ret(0, v_retval);
+        arch::Gp v_fcinfo_isnull =
             emit_load_isnull_from_FunctionCallInfoBaseData(Jitcc, v_fcinfo);
 
         /*
@@ -1107,20 +1052,17 @@ bool AsmJitCompileExpr(ExprState *State) {
          * (same result as if there'd been NULLs, hence reuse
          * b_hasnull).
          */
-        x86::Gp v_argsequal = Jitcc.newUInt64("v_argsequal.u64");
-        Jitcc.xor_(v_argsequal, v_argsequal);
-        Jitcc.cmp(v_fcinfo_isnull, jit::imm(0));
-        Jitcc.sete(v_argsequal);
-        Jitcc.and_(v_argsequal, v_retval);
+        arch::Gp v_argsequal = Jitcc.new_gp64("v_argsequal");
+        EmitSetEQ(Jitcc, v_argsequal, v_fcinfo_isnull, 0);
+        EmitBitwiseAnd(Jitcc, v_argsequal, v_retval);
 
-        Jitcc.cmp(v_argsequal, jit::imm(1));
-        Jitcc.jne(L_HasNull);
+        EmitCondJumpNE(Jitcc, v_argsequal, 1, L_HasNull);
 
         /* build block setting result to NULL, if args are equal */
-        x86::Gp v_resnullp =
-            EmitLoadConstUIntPtr(Jitcc, "op.resnullp.uintptr", op->resnull);
-        x86::Gp v_resvaluep =
-            EmitLoadConstUIntPtr(Jitcc, "op.resvaluep.uintptr", op->resvalue);
+        arch::Gp v_resnullp =
+            EmitLoadConstUIntPtr(Jitcc, "op.resnullp", op->resnull);
+        arch::Gp v_resvaluep =
+            EmitLoadConstUIntPtr(Jitcc, "op.resvaluep", op->resvalue);
         EmitStoreToArray(Jitcc, v_resnullp, 0, jit::imm(1), sizeof(bool));
         EmitStoreToArray(Jitcc, v_resvaluep, 0, jit::imm(0), sizeof(Datum));
       }
@@ -1160,48 +1102,44 @@ bool AsmJitCompileExpr(ExprState *State) {
 
     case EEOP_ROWCOMPARE_STEP: {
       FunctionCallInfo fcinfo = op->d.rowcompare_step.fcinfo_data;
-      x86::Gp v_fcinfo =
-          EmitLoadConstUIntPtr(Jitcc, "v_fcinfo.uintptr", fcinfo);
-      jit::Label L_Null = Jitcc.newLabel();
+      arch::Gp v_fcinfo = EmitLoadConstUIntPtr(Jitcc, "v_fcinfo", fcinfo);
+      jit::Label L_Null = Jitcc.new_label();
       /*
        * If function is strict, and either arg is null, we're
        * done.
        */
       if (op->d.rowcompare_step.finfo->fn_strict) {
-        x86::Gp v_argnull0 = LoadFuncArgNull(Jitcc, v_fcinfo, 0);
-        x86::Gp v_argnull1 = LoadFuncArgNull(Jitcc, v_fcinfo, 1);
-        x86::Gp v_anyargisnull = Jitcc.newInt8("v_anyargisnull.i8");
+        arch::Gp v_argnull0 = LoadFuncArgNull(Jitcc, v_fcinfo, 0);
+        arch::Gp v_argnull1 = LoadFuncArgNull(Jitcc, v_fcinfo, 1);
+        arch::Gp v_anyargisnull = Jitcc.new_gp32("v_anyargisnull");
         Jitcc.mov(v_anyargisnull, v_argnull0);
-        Jitcc.or_(v_anyargisnull, v_argnull1);
-        Jitcc.cmp(v_anyargisnull, jit::imm(1));
-        Jitcc.je(L_Null);
+        EmitBitwiseOr(Jitcc, v_anyargisnull, v_argnull1);
+        EmitCondJumpEQ(Jitcc, v_anyargisnull, 1, L_Null);
       }
 
-      x86::Gp v_retval = Jitcc.newUInt64("v_retval.u64");
+      arch::Gp v_retval = Jitcc.new_gp64("v_retval");
       jit::InvokeNode *PGFunc;
-      Jitcc.invoke(&PGFunc, jit::imm(fcinfo->flinfo->fn_addr),
+      Jitcc.invoke(asmjit::Out(PGFunc), JIT_FN_PTR(Jitcc, fcinfo->flinfo->fn_addr),
                    jit::FuncSignature::build<Datum, FunctionCallInfo>());
-      PGFunc->setArg(0, v_fcinfo);
-      PGFunc->setRet(0, v_retval);
-      x86::Gp v_fcinfo_isnull =
+      PGFunc->set_arg(0, v_fcinfo);
+      PGFunc->set_ret(0, v_retval);
+      arch::Gp v_fcinfo_isnull =
           emit_load_isnull_from_FunctionCallInfoBaseData(Jitcc, v_fcinfo);
 
-      x86::Gp v_resvaluep =
-          EmitLoadConstUIntPtr(Jitcc, "op.resvaluep.uintptr", op->resvalue);
+      arch::Gp v_resvaluep =
+          EmitLoadConstUIntPtr(Jitcc, "op.resvaluep", op->resvalue);
       EmitStoreToArray(Jitcc, v_resvaluep, 0, v_retval, sizeof(Datum));
       /* if result of function is NULL, force NULL result */
-      Jitcc.cmp(v_fcinfo_isnull, jit::imm(0));
-      Jitcc.jne(L_Null);
+      EmitCondJumpNE(Jitcc, v_fcinfo_isnull, 0, L_Null);
       /* if results equal, compare next, otherwise done */
-      Jitcc.cmp(v_retval, jit::imm(0));
-      Jitcc.je(L_opblocks[opno + 1]);
-      Jitcc.jmp(L_opblocks[op->d.rowcompare_step.jumpdone]);
+      EmitCondJumpEQ(Jitcc, v_retval, 0, L_opblocks[opno + 1]);
+      EmitJump(Jitcc, L_opblocks[op->d.rowcompare_step.jumpdone]);
 
       Jitcc.bind(L_Null);
-      x86::Gp v_resnullp =
-          EmitLoadConstUIntPtr(Jitcc, "op.resnullp.uintptr", op->resnull);
+      arch::Gp v_resnullp =
+          EmitLoadConstUIntPtr(Jitcc, "op.resnullp", op->resnull);
       EmitStoreToArray(Jitcc, v_resnullp, 0, jit::imm(1), sizeof(bool));
-      Jitcc.jmp(L_opblocks[op->d.rowcompare_step.jumpnull]);
+      EmitJump(Jitcc, L_opblocks[op->d.rowcompare_step.jumpnull]);
       break;
     }
 
@@ -1213,28 +1151,26 @@ bool AsmJitCompileExpr(ExprState *State) {
        * careful about sign (used as a 64 bit value it's
        * otherwise wrong).
        */
-      x86::Gp v_resvaluep =
-          EmitLoadConstUIntPtr(Jitcc, "op.resvaluep.uintptr", op->resvalue);
-      x86::Gp v_resnullp =
-          EmitLoadConstUIntPtr(Jitcc, "op.resnullp.uintptr", op->resnull);
-      x86::Gp v_cmpop = Jitcc.newInt32("v_cmpop.i32");
+      arch::Gp v_resvaluep =
+          EmitLoadConstUIntPtr(Jitcc, "op.resvaluep", op->resvalue);
+      arch::Gp v_resnullp =
+          EmitLoadConstUIntPtr(Jitcc, "op.resnullp", op->resnull);
+      arch::Gp v_cmpop = Jitcc.new_gp32("v_cmpop");
       EmitLoadFromArray(Jitcc, v_resvaluep, 0, v_cmpop, sizeof(int32));
-      x86::Gp v_cmpresult = Jitcc.newUInt64("v_cmpresult.u64");
-      Jitcc.xor_(v_cmpresult, v_cmpresult);
-      Jitcc.cmp(v_cmpop, jit::imm(0));
+      arch::Gp v_cmpresult = Jitcc.new_gp64("v_cmpresult");
 
       switch (rctype) {
       case COMPARE_LT:
-        Jitcc.setl(v_cmpresult);
+        EmitSetLT(Jitcc, v_cmpresult, v_cmpop);
         break;
       case COMPARE_LE:
-        Jitcc.setle(v_cmpresult);
+        EmitSetLE(Jitcc, v_cmpresult, v_cmpop);
         break;
       case COMPARE_GT:
-        Jitcc.setg(v_cmpresult);
+        EmitSetGT(Jitcc, v_cmpresult, v_cmpop);
         break;
       case COMPARE_GE:
-        Jitcc.setge(v_cmpresult);
+        EmitSetGE(Jitcc, v_cmpresult, v_cmpop);
         break;
       default:
         /* EQ and NE cases aren't allowed here */
@@ -1269,26 +1205,26 @@ bool AsmJitCompileExpr(ExprState *State) {
     }
 
     case EEOP_DOMAIN_TESTVAL: {
-      x86::Gp v_resvaluep = EmitLoadConstUIntPtr(Jitcc, "v_resvaluep.uintptr",
-                                                 op->resvalue),
-              v_resnullp = EmitLoadConstUIntPtr(Jitcc, "v_resnullp.uintptr",
-                                                op->resnull);
+      arch::Gp v_resvaluep =
+                  EmitLoadConstUIntPtr(Jitcc, "v_resvaluep", op->resvalue),
+               v_resnullp =
+                   EmitLoadConstUIntPtr(Jitcc, "v_resnullp", op->resnull);
       if (op->d.casetest.value) {
-        x86::Gp v_casevaluep = EmitLoadConstUIntPtr(
-                    Jitcc, "v_casevaluep.uintptr", op->d.casetest.value),
-                v_casenullp = EmitLoadConstUIntPtr(Jitcc, "v_casenullp.uintptr",
-                                                   op->d.casetest.isnull);
-        x86::Gp v_casevalue = Jitcc.newUIntPtr("v_casevalue.uintptr"),
-                v_casenull = Jitcc.newInt8("v_casenull.i8");
+        arch::Gp v_casevaluep = EmitLoadConstUIntPtr(
+                    Jitcc, "v_casevaluep", op->d.casetest.value),
+                 v_casenullp = EmitLoadConstUIntPtr(Jitcc, "v_casenullp",
+                                                    op->d.casetest.isnull);
+        arch::Gp v_casevalue = Jitcc.new_gp_ptr("v_casevalue"),
+                 v_casenull = Jitcc.new_gp32("v_casenull");
         EmitLoadFromArray(Jitcc, v_casevaluep, 0, v_casevalue, sizeof(Datum));
         EmitLoadFromArray(Jitcc, v_casenullp, 0, v_casenull, sizeof(bool));
 
         EmitStoreToArray(Jitcc, v_resvaluep, 0, v_casevalue, sizeof(Datum));
         EmitStoreToArray(Jitcc, v_resnullp, 0, v_casenull, sizeof(bool));
       } else {
-        x86::Gp v_casevalue =
+        arch::Gp v_casevalue =
             emit_load_domainValue_datum_from_ExprContext(Jitcc, v_econtext);
-        x86::Gp v_casenull =
+        arch::Gp v_casenull =
             emit_load_domainValue_isNull_from_ExprContext(Jitcc, v_econtext);
 
         EmitStoreToArray(Jitcc, v_resvaluep, 0, v_casevalue, sizeof(Datum));
@@ -1308,10 +1244,10 @@ bool AsmJitCompileExpr(ExprState *State) {
     }
 
     case EEOP_HASHDATUM_SET_INITVAL: {
-      x86::Gp v_resvaluep = EmitLoadConstUIntPtr(Jitcc, "v_resvaluep.uintptr",
-                                                 op->resvalue),
-              v_resnullp = EmitLoadConstUIntPtr(Jitcc, "v_resnullp.uintptr",
-                                                op->resnull);
+      arch::Gp v_resvaluep =
+                  EmitLoadConstUIntPtr(Jitcc, "v_resvaluep", op->resvalue),
+               v_resnullp =
+                   EmitLoadConstUIntPtr(Jitcc, "v_resnullp", op->resnull);
       EmitStoreToArray(Jitcc, v_resvaluep, 0,
                        jit::imm(op->d.hashdatum_initvalue.init_value),
                        sizeof(Datum));
@@ -1323,9 +1259,9 @@ bool AsmJitCompileExpr(ExprState *State) {
     case EEOP_HASHDATUM_FIRST_STRICT:
     case EEOP_HASHDATUM_NEXT32:
     case EEOP_HASHDATUM_NEXT32_STRICT: {
-      jit::Label L_IfNull = Jitcc.newLabel();
+      jit::Label L_IfNull = Jitcc.new_label();
       FunctionCallInfo fcinfo = op->d.hashdatum.fcinfo_data;
-      x86::Gp v_prevhash = Jitcc.newUIntPtr("prevhash.uintptr");
+      arch::Gp v_prevhash = Jitcc.new_gp_ptr("prevhash");
       /*
        * When performing the next hash and not in strict mode we
        * perform a rotation of the previously stored hash value
@@ -1336,86 +1272,68 @@ bool AsmJitCompileExpr(ExprState *State) {
        * away the hash value and return NULL.
        */
       if (opcode == EEOP_HASHDATUM_NEXT32) {
-        /*
-         * Fetch the previously hashed value from where the
-         * EEOP_HASHDATUM_FIRST operation stored it.
-         */
-        x86::Gp v_resvaluep =
-            EmitLoadConstUIntPtr(Jitcc, "v_resvaluep.uintptr", op->resvalue);
+        arch::Gp v_resvaluep =
+            EmitLoadConstUIntPtr(Jitcc, "v_resvaluep", op->resvalue);
         EmitLoadFromArray(Jitcc, v_resvaluep, 0, v_prevhash, sizeof(Datum));
 
         /*
          * Rotate bits left by 1 bit.  Be careful not to
          * overflow uint32 when working with size_t.
          */
-        x86::Gp v_tmp = Jitcc.newUInt64("v_tmp.u64");
+        arch::Gp v_tmp = Jitcc.new_gp64("v_tmp");
         Jitcc.mov(v_tmp, v_prevhash);
-        Jitcc.shl(v_tmp, jit::imm(1));
-        Jitcc.and_(v_tmp, jit::imm(0xffffffff));
-        Jitcc.shr(v_prevhash, jit::imm(31));
-        Jitcc.or_(v_prevhash, v_tmp);
+        EmitShlImm(Jitcc, v_tmp, 1);
+        EmitBitwiseAndImm(Jitcc, v_tmp, 0xffffffff);
+        EmitShrImm(Jitcc, v_prevhash, 31);
+        EmitBitwiseOr(Jitcc, v_prevhash, v_tmp);
       }
 
       /* We expect the hash function to have 1 argument */
       if (fcinfo->nargs != 1)
         ereport(ERROR, (errmsg("incorrect number of function arguments")));
 
-      x86::Gp v_fcinfo = EmitLoadConstUIntPtr(Jitcc, "fcinfo.uintptr", fcinfo);
+      arch::Gp v_fcinfo = EmitLoadConstUIntPtr(Jitcc, "fcinfo", fcinfo);
       /* emit code to check if the input parameter is NULL */
-      x86::Gp v_argisnull = LoadFuncArgNull(Jitcc, v_fcinfo, 0);
-      Jitcc.cmp(v_argisnull, jit::imm(1));
-      Jitcc.je(L_IfNull);
+      arch::Gp v_argisnull = LoadFuncArgNull(Jitcc, v_fcinfo, 0);
+      EmitCondJumpEQ(Jitcc, v_argisnull, 1, L_IfNull);
       {
         /* If not null. */
-        /*
-         * Rotate the previously stored hash value when performing
-         * NEXT32 in strict mode.  In non-strict mode we already
-         * did this before checking for NULLs.
-         */
         if (opcode == EEOP_HASHDATUM_NEXT32_STRICT) {
-          /*
-           * Fetch the previously hashed value from where the
-           * EEOP_HASHDATUM_FIRST_STRICT operation stored it.
-           */
-          x86::Gp v_resvaluep =
-              EmitLoadConstUIntPtr(Jitcc, "v_resvaluep.uintptr", op->resvalue);
+          arch::Gp v_resvaluep =
+              EmitLoadConstUIntPtr(Jitcc, "v_resvaluep", op->resvalue);
           EmitLoadFromArray(Jitcc, v_resvaluep, 0, v_prevhash, sizeof(Datum));
 
-          /*
-           * Rotate bits left by 1 bit.  Be careful not to
-           * overflow uint32 when working with size_t.
-           */
-          x86::Gp v_tmp = Jitcc.newUInt64("v_tmp.u64");
+          arch::Gp v_tmp = Jitcc.new_gp64("v_tmp");
           Jitcc.mov(v_tmp, v_prevhash);
-          Jitcc.shl(v_tmp, jit::imm(1));
-          Jitcc.and_(v_tmp, jit::imm(0xffffffff));
-          Jitcc.shr(v_prevhash, jit::imm(31));
-          Jitcc.or_(v_prevhash, v_tmp);
+          EmitShlImm(Jitcc, v_tmp, 1);
+          EmitBitwiseAndImm(Jitcc, v_tmp, 0xffffffff);
+          EmitShrImm(Jitcc, v_prevhash, 31);
+          EmitBitwiseOr(Jitcc, v_prevhash, v_tmp);
         }
 
         /* call the hash function */
-        x86::Gp v_retval = Jitcc.newUInt64("v_retval.u64");
+        arch::Gp v_retval = Jitcc.new_gp64("v_retval");
         jit::InvokeNode *PGFunc;
-        Jitcc.invoke(&PGFunc, jit::imm(fcinfo->flinfo->fn_addr),
+        Jitcc.invoke(asmjit::Out(PGFunc), JIT_FN_PTR(Jitcc, fcinfo->flinfo->fn_addr),
                      jit::FuncSignature::build<Datum, FunctionCallInfo>());
-        PGFunc->setArg(0, v_fcinfo);
-        PGFunc->setRet(0, v_retval);
+        PGFunc->set_arg(0, v_fcinfo);
+        PGFunc->set_ret(0, v_retval);
         /*
          * For NEXT32 ops, XOR (^) the returned hash value with
          * the existing hash value.
          */
         if (opcode == EEOP_HASHDATUM_NEXT32 ||
             opcode == EEOP_HASHDATUM_NEXT32_STRICT)
-          Jitcc.xor_(v_retval, v_prevhash);
+          EmitBitwiseXor(Jitcc, v_retval, v_prevhash);
 
-        x86::Gp v_resvaluep = EmitLoadConstUIntPtr(Jitcc, "v_resvaluep.uintptr",
-                                                   op->resvalue),
-                v_resnullp = EmitLoadConstUIntPtr(Jitcc, "v_resnullp.uintptr",
-                                                  op->resnull);
+        arch::Gp v_resvaluep =
+                    EmitLoadConstUIntPtr(Jitcc, "v_resvaluep", op->resvalue),
+                 v_resnullp =
+                     EmitLoadConstUIntPtr(Jitcc, "v_resnullp", op->resnull);
         EmitStoreToArray(Jitcc, v_resvaluep, 0, v_retval, sizeof(Datum));
         EmitStoreToArray(Jitcc, v_resnullp, 0, jit::imm(0), sizeof(bool));
 
-        Jitcc.jmp(L_opblocks[opno + 1]);
+        EmitJump(Jitcc, L_opblocks[opno + 1]);
       }
 
       Jitcc.bind(L_IfNull);
@@ -1426,19 +1344,19 @@ bool AsmJitCompileExpr(ExprState *State) {
            * In strict node, NULL inputs result in NULL.  Save
            * the NULL result and goto jumpdone.
            */
-          x86::Gp v_resvaluep = EmitLoadConstUIntPtr(
-                      Jitcc, "v_resvaluep.uintptr", op->resvalue),
-                  v_resnullp =
-                      EmitLoadConstUIntPtr(Jitcc, "v_resnullp", op->resnull);
+          arch::Gp v_resvaluep =
+                      EmitLoadConstUIntPtr(Jitcc, "v_resvaluep", op->resvalue),
+                   v_resnullp =
+                       EmitLoadConstUIntPtr(Jitcc, "v_resnullp", op->resnull);
           EmitStoreToArray(Jitcc, v_resnullp, 0, jit::imm(1), sizeof(bool));
           EmitStoreToArray(Jitcc, v_resvaluep, 0, jit::imm(0), sizeof(Datum));
 
-          Jitcc.jmp(L_opblocks[op->d.hashdatum.jumpdone]);
+          EmitJump(Jitcc, L_opblocks[op->d.hashdatum.jumpdone]);
         } else {
-          x86::Gp v_resvaluep = EmitLoadConstUIntPtr(
-                      Jitcc, "v_resvaluep.uintptr", op->resvalue),
-                  v_resnullp = EmitLoadConstUIntPtr(Jitcc, "v_resnullp.uintptr",
-                                                    op->resnull);
+          arch::Gp v_resvaluep =
+                      EmitLoadConstUIntPtr(Jitcc, "v_resvaluep", op->resvalue),
+                   v_resnullp =
+                       EmitLoadConstUIntPtr(Jitcc, "v_resnullp", op->resnull);
           EmitStoreToArray(Jitcc, v_resnullp, 0, jit::imm(0), sizeof(bool));
 
           if (opcode == EEOP_HASHDATUM_NEXT32) {
@@ -1449,7 +1367,7 @@ bool AsmJitCompileExpr(ExprState *State) {
             EmitStoreToArray(Jitcc, v_resvaluep, 0, jit::imm(0), sizeof(Datum));
           }
 
-          Jitcc.jmp(L_opblocks[opno + 1]);
+          EmitJump(Jitcc, L_opblocks[opno + 1]);
         }
       }
 
@@ -1488,19 +1406,19 @@ bool AsmJitCompileExpr(ExprState *State) {
 
     case EEOP_JSONEXPR_PATH: {
       JsonExprState *jsestate = op->d.jsonexpr.jsestate;
-      x86::Gp v_ret = Jitcc.newInt32("v_ret.i32");
+      arch::Gp v_ret = Jitcc.new_gp32("v_ret");
       /*
        * Call ExecEvalJsonExprPath().  It returns the address of
        * the step to perform next.
        */
       jit::InvokeNode *InvokeExecEvalJsonExprPath;
-      Jitcc.invoke(&InvokeExecEvalJsonExprPath, jit::imm(ExecEvalJsonExprPath),
+      Jitcc.invoke(asmjit::Out(InvokeExecEvalJsonExprPath), JIT_FN_PTR(Jitcc, ExecEvalJsonExprPath),
                    jit::FuncSignature::build<int, ExprState *, ExprEvalStep *,
                                              ExprContext *>());
-      InvokeExecEvalJsonExprPath->setArg(0, v_state);
-      InvokeExecEvalJsonExprPath->setArg(1, jit::imm(op));
-      InvokeExecEvalJsonExprPath->setArg(2, v_econtext);
-      InvokeExecEvalJsonExprPath->setRet(0, v_ret);
+      InvokeExecEvalJsonExprPath->set_arg(0, v_state);
+      InvokeExecEvalJsonExprPath->set_arg(1, jit::imm(op));
+      InvokeExecEvalJsonExprPath->set_arg(2, v_econtext);
+      InvokeExecEvalJsonExprPath->set_ret(0, v_ret);
 
       /*
        * Build a switch to map the return value (v_ret above),
@@ -1509,21 +1427,21 @@ bool AsmJitCompileExpr(ExprState *State) {
        * jump_eval_coercion, or jump_end.
        */
       if (jsestate->jump_empty >= 0) {
-        Jitcc.cmp(v_ret, jit::imm(jsestate->jump_empty));
-        Jitcc.je(L_opblocks[jsestate->jump_empty]);
+        EmitCondJumpEQ(Jitcc, v_ret, jsestate->jump_empty,
+                       L_opblocks[jsestate->jump_empty]);
       }
 
       if (jsestate->jump_error >= 0) {
-        Jitcc.cmp(v_ret, jit::imm(jsestate->jump_error));
-        Jitcc.je(L_opblocks[jsestate->jump_error]);
+        EmitCondJumpEQ(Jitcc, v_ret, jsestate->jump_error,
+                       L_opblocks[jsestate->jump_error]);
       }
 
       if (jsestate->jump_eval_coercion >= 0) {
-        Jitcc.cmp(v_ret, jit::imm(jsestate->jump_eval_coercion));
-        Jitcc.je(L_opblocks[jsestate->jump_eval_coercion]);
+        EmitCondJumpEQ(Jitcc, v_ret, jsestate->jump_eval_coercion,
+                       L_opblocks[jsestate->jump_eval_coercion]);
       }
 
-      Jitcc.jmp(L_opblocks[jsestate->jump_end]);
+      EmitJump(Jitcc, L_opblocks[jsestate->jump_end]);
       break;
     }
 
@@ -1541,12 +1459,12 @@ bool AsmJitCompileExpr(ExprState *State) {
        * Returns a Datum whose value is the precomputed aggregate value
        * found in the given expression context.
        */
-      x86::Gp v_aggvaluesp =
+      arch::Gp v_aggvaluesp =
           emit_load_ecxt_aggvalues_from_ExprContext(Jitcc, v_econtext);
-      x86::Gp v_aggnullsp =
+      arch::Gp v_aggnullsp =
           emit_load_ecxt_aggnulls_from_ExprContext(Jitcc, v_econtext);
-      x86::Gp v_value = Jitcc.newUIntPtr("v_value.uintptr");
-      x86::Gp v_isnull = Jitcc.newInt8("v_isnull.i8");
+      arch::Gp v_value = Jitcc.new_gp_ptr("v_value");
+      arch::Gp v_isnull = Jitcc.new_gp32("v_isnull");
 
       /* load agg value / null */
       EmitLoadFromArray(Jitcc, v_aggvaluesp, op->d.aggref.aggno, v_value,
@@ -1555,10 +1473,10 @@ bool AsmJitCompileExpr(ExprState *State) {
                         sizeof(bool));
 
       /* and store result */
-      x86::Gp v_resnullp =
-          EmitLoadConstUIntPtr(Jitcc, "v_resnullp.uintptr", op->resnull);
-      x86::Gp v_resvaluep =
-          EmitLoadConstUIntPtr(Jitcc, "v_resvaluep.uintptr", op->resvalue);
+      arch::Gp v_resnullp =
+          EmitLoadConstUIntPtr(Jitcc, "v_resnullp", op->resnull);
+      arch::Gp v_resvaluep =
+          EmitLoadConstUIntPtr(Jitcc, "v_resvaluep", op->resvalue);
       EmitStoreToArray(Jitcc, v_resnullp, 0, v_isnull, sizeof(bool));
       EmitStoreToArray(Jitcc, v_resvaluep, 0, v_value, sizeof(Datum));
 
@@ -1577,27 +1495,45 @@ bool AsmJitCompileExpr(ExprState *State) {
        * up in ExecInitWindowAgg() after initializing the
        * expression). So load it from memory each time round.
        */
-      x86::Gp v_wfuncnop =
-          EmitLoadConstUIntPtr(Jitcc, "v_wfuncnop.uintptr", &wfunc->wfuncno);
-      x86::Gp v_wfuncno = Jitcc.newInt32("v_wfuncno.i32");
+      arch::Gp v_wfuncnop =
+          EmitLoadConstUIntPtr(Jitcc, "v_wfuncnop", &wfunc->wfuncno);
+      arch::Gp v_wfuncno = Jitcc.new_gp32("v_wfuncno");
       EmitLoadFromArray(Jitcc, v_wfuncnop, 0, v_wfuncno, sizeof(int32));
-      x86::Gp v_aggvaluesp =
+      arch::Gp v_aggvaluesp =
           emit_load_ecxt_aggvalues_from_ExprContext(Jitcc, v_econtext);
-      x86::Gp v_aggnullsp =
+      arch::Gp v_aggnullsp =
           emit_load_ecxt_aggnulls_from_ExprContext(Jitcc, v_econtext);
-      x86::Gp v_value = Jitcc.newUIntPtr("v_value.uintptr");
-      x86::Gp v_isnull = Jitcc.newInt8("v_isnull.i8");
+      arch::Gp v_value = Jitcc.new_gp_ptr("v_value");
+      arch::Gp v_isnull = Jitcc.new_gp32("v_isnull");
 
-      /* load agg value / null */
-      x86::Mem m_aggvaluesp = x86::ptr(v_aggvaluesp, v_wfuncno, 3);
-      x86::Mem m_aggnullsp = x86::ptr(v_aggnullsp, v_wfuncno, 0);
-      Jitcc.mov(v_value, m_aggvaluesp);
-      Jitcc.mov(v_isnull, m_aggnullsp);
+      /*
+       * Load values[wfuncno] and nulls[wfuncno] using indexed addressing.
+       * Datum is pointer-sized, bool is 1 byte.
+       */
+      {
+        /* v_value = aggvalues[wfuncno] (each slot is sizeof(Datum) bytes) */
+        arch::Gp v_wfuncno64 = Jitcc.new_gp64("v_wfuncno64");
+        EmitSignExtend32to64(Jitcc, v_wfuncno64, v_wfuncno);
+        /* multiply by sizeof(Datum) = 8 on 64-bit */
+        arch::Gp v_offset = Jitcc.new_gp64("v_offset");
+        Jitcc.mov(v_offset, v_wfuncno64);
+        EmitShlImm(Jitcc, v_offset, 3); /* << 3 = * 8 */
+        arch::Gp v_valueptr = Jitcc.new_gp_ptr("v_valueptr");
+        Jitcc.mov(v_valueptr, v_aggvaluesp);
+        EmitAddReg(Jitcc, v_valueptr, v_offset);
+        EmitLoadFromArray(Jitcc, v_valueptr, 0, v_value, sizeof(Datum));
 
-      x86::Gp v_resnullp =
-          EmitLoadConstUIntPtr(Jitcc, "v_resnullp.uintptr", op->resnull);
-      x86::Gp v_resvaluep =
-          EmitLoadConstUIntPtr(Jitcc, "v_resvaluep.uintptr", op->resvalue);
+        /* v_isnull = aggnulls[wfuncno] (each slot is 1 byte) */
+        arch::Gp v_nullptr = Jitcc.new_gp_ptr("v_nullptr");
+        Jitcc.mov(v_nullptr, v_aggnullsp);
+        EmitAddReg(Jitcc, v_nullptr, v_wfuncno64);
+        EmitLoadFromArray(Jitcc, v_nullptr, 0, v_isnull, sizeof(bool));
+      }
+
+      arch::Gp v_resnullp =
+          EmitLoadConstUIntPtr(Jitcc, "v_resnullp", op->resnull);
+      arch::Gp v_resvaluep =
+          EmitLoadConstUIntPtr(Jitcc, "v_resvaluep", op->resvalue);
       EmitStoreToArray(Jitcc, v_resnullp, 0, v_isnull, sizeof(bool));
       EmitStoreToArray(Jitcc, v_resvaluep, 0, v_value, sizeof(Datum));
 
@@ -1617,47 +1553,46 @@ bool AsmJitCompileExpr(ExprState *State) {
     case EEOP_AGG_STRICT_DESERIALIZE:
     case EEOP_AGG_DESERIALIZE: {
       FunctionCallInfo fcinfo = op->d.agg_deserialize.fcinfo_data;
-      x86::Gp v_fcinfo =
-          EmitLoadConstUIntPtr(Jitcc, "v_fcinfo.uintptr", fcinfo);
+      arch::Gp v_fcinfo = EmitLoadConstUIntPtr(Jitcc, "v_fcinfo", fcinfo);
 
       if (opcode == EEOP_AGG_STRICT_DESERIALIZE) {
-        x86::Gp v_argnull0 = LoadFuncArgNull(Jitcc, v_fcinfo, 0);
-        Jitcc.cmp(v_argnull0, jit::imm(1));
-        Jitcc.je(L_opblocks[op->d.agg_deserialize.jumpnull]);
+        arch::Gp v_argnull0 = LoadFuncArgNull(Jitcc, v_fcinfo, 0);
+        EmitCondJumpEQ(Jitcc, v_argnull0, 1,
+                       L_opblocks[op->d.agg_deserialize.jumpnull]);
       }
 
       AggState *aggstate = castNode(AggState, State->parent);
-      x86::Gp v_tmpcontext =
-          EmitLoadConstUIntPtr(Jitcc, "v_tmpcontext.uintptr",
+      arch::Gp v_tmpcontext =
+          EmitLoadConstUIntPtr(Jitcc, "v_tmpcontext",
                                aggstate->tmpcontext->ecxt_per_tuple_memory);
-      x86::Gp v_oldcontext = Jitcc.newUIntPtr("v_oldcontext.uintptr");
+      arch::Gp v_oldcontext = Jitcc.new_gp_ptr("v_oldcontext");
       jit::InvokeNode *InvokeMemoryContextSwitchTo;
-      Jitcc.invoke(&InvokeMemoryContextSwitchTo,
-                   jit::imm(MemoryContextSwitchTo),
+      Jitcc.invoke(asmjit::Out(InvokeMemoryContextSwitchTo),
+                   JIT_FN_PTR(Jitcc, MemoryContextSwitchTo),
                    jit::FuncSignature::build<MemoryContext, MemoryContext>());
-      InvokeMemoryContextSwitchTo->setArg(0, v_tmpcontext);
-      InvokeMemoryContextSwitchTo->setRet(0, v_oldcontext);
+      InvokeMemoryContextSwitchTo->set_arg(0, v_tmpcontext);
+      InvokeMemoryContextSwitchTo->set_ret(0, v_oldcontext);
 
       jit::InvokeNode *PGFunc;
-      x86::Gp v_retval = Jitcc.newUIntPtr("v_retval.uintptr");
-      Jitcc.invoke(&PGFunc, jit::imm(fcinfo->flinfo->fn_addr),
+      arch::Gp v_retval = Jitcc.new_gp_ptr("v_retval");
+      Jitcc.invoke(asmjit::Out(PGFunc), JIT_FN_PTR(Jitcc, fcinfo->flinfo->fn_addr),
                    jit::FuncSignature::build<Datum, FunctionCallInfo>());
-      PGFunc->setArg(0, fcinfo);
-      PGFunc->setRet(0, v_retval);
-      x86::Gp v_fcinfo_isnull =
+      PGFunc->set_arg(0, fcinfo);
+      PGFunc->set_ret(0, v_retval);
+      arch::Gp v_fcinfo_isnull =
           emit_load_isnull_from_FunctionCallInfoBaseData(Jitcc, v_fcinfo);
 
       InvokeMemoryContextSwitchTo = nullptr;
-      Jitcc.invoke(&InvokeMemoryContextSwitchTo,
-                   jit::imm(MemoryContextSwitchTo),
+      Jitcc.invoke(asmjit::Out(InvokeMemoryContextSwitchTo),
+                   JIT_FN_PTR(Jitcc, MemoryContextSwitchTo),
                    jit::FuncSignature::build<MemoryContext, MemoryContext>());
-      InvokeMemoryContextSwitchTo->setArg(0, v_oldcontext);
-      InvokeMemoryContextSwitchTo->setRet(0, v_oldcontext);
+      InvokeMemoryContextSwitchTo->set_arg(0, v_oldcontext);
+      InvokeMemoryContextSwitchTo->set_ret(0, v_oldcontext);
 
-      x86::Gp v_resnullp =
-          EmitLoadConstUIntPtr(Jitcc, "v_resnullp.uintptr", op->resnull);
-      x86::Gp v_resvaluep =
-          EmitLoadConstUIntPtr(Jitcc, "v_resvaluep.uintptr", op->resvalue);
+      arch::Gp v_resnullp =
+          EmitLoadConstUIntPtr(Jitcc, "v_resnullp", op->resnull);
+      arch::Gp v_resvaluep =
+          EmitLoadConstUIntPtr(Jitcc, "v_resvaluep", op->resvalue);
       EmitStoreToArray(Jitcc, v_resnullp, 0, v_fcinfo_isnull, sizeof(bool));
       EmitStoreToArray(Jitcc, v_resvaluep, 0, v_retval, sizeof(Datum));
 
@@ -1673,24 +1608,25 @@ bool AsmJitCompileExpr(ExprState *State) {
       Assert(nargs > 0);
 
       int jumpnull = op->d.agg_strict_input_check.jumpnull;
-      x86::Gp v_argsp = EmitLoadConstUIntPtr(Jitcc, "v_argsp.uintptr", args);
-      x86::Gp v_nullsp = EmitLoadConstUIntPtr(Jitcc, "v_nullsp.uintptr", nulls);
+      arch::Gp v_argsp = EmitLoadConstUIntPtr(Jitcc, "v_argsp", args);
+      arch::Gp v_nullsp = EmitLoadConstUIntPtr(Jitcc, "v_nullsp", nulls);
 
       /* strict function, check for NULL args */
       for (int argno = 0; argno < nargs; ++argno) {
-        x86::Gp v_argisnull = Jitcc.newInt8("v_argisnull.i8");
+        arch::Gp v_argisnull = Jitcc.new_gp32("v_argisnull");
         if (opcode == EEOP_AGG_STRICT_INPUT_CHECK_NULLS) {
           EmitLoadFromArray(Jitcc, v_nullsp, argno, v_argisnull, sizeof(bool));
         } else {
-          x86::Mem m_argnisnull = x86::ptr(v_argsp,
-                                           argno * sizeof(NullableDatum) +
-                                               offsetof(NullableDatum, isnull),
-                                           sizeof(bool));
-          Jitcc.mov(v_argisnull, m_argnisnull);
+          /* Load isnull field from NullableDatum array */
+          size_t off = (size_t)argno * sizeof(NullableDatum) +
+                       offsetof(NullableDatum, isnull);
+          arch::Gp v_argsp_tmp = EmitLoadConstUIntPtr(Jitcc, "v_argsp_tmp",
+                                                       args);
+          EmitLoadFromFlexibleArray(Jitcc, v_argsp_tmp, off, 0, v_argisnull,
+                                    sizeof(bool));
         }
 
-        Jitcc.cmp(v_argisnull, jit::imm(1));
-        Jitcc.je(L_opblocks[jumpnull]);
+        EmitCondJumpEQ(Jitcc, v_argisnull, 1, L_opblocks[jumpnull]);
       }
 
       break;
@@ -1698,20 +1634,14 @@ bool AsmJitCompileExpr(ExprState *State) {
     case EEOP_AGG_PLAIN_PERGROUP_NULLCHECK: {
       int jumpnull = op->d.agg_plain_pergroup_nullcheck.jumpnull;
 
-      /*
-       * pergroup_allaggs = aggstate->all_pergroups
-       * [op->d.agg_plain_pergroup_nullcheck.setoff];
-       */
-      x86::Gp v_aggstatep = emit_load_parent_from_ExprState(Jitcc, v_state);
-      x86::Gp v_allpergroupsp =
+      arch::Gp v_aggstatep = emit_load_parent_from_ExprState(Jitcc, v_state);
+      arch::Gp v_allpergroupsp =
           emit_load_all_pergroups_from_AggState(Jitcc, v_aggstatep);
-      x86::Gp v_pergroup_allaggs =
-          Jitcc.newUIntPtr("v_pergroup_allaggs.uintptr");
+      arch::Gp v_pergroup_allaggs = Jitcc.new_gp_ptr("v_pergroup_allaggs");
       EmitLoadFromArray(Jitcc, v_allpergroupsp,
                         op->d.agg_plain_pergroup_nullcheck.setoff,
                         v_pergroup_allaggs, sizeof(Datum));
-      Jitcc.cmp(v_pergroup_allaggs, jit::imm(0));
-      Jitcc.je(L_opblocks[jumpnull]);
+      EmitCondJumpEQ(Jitcc, v_pergroup_allaggs, 0, L_opblocks[jumpnull]);
       break;
     }
 
@@ -1724,9 +1654,9 @@ bool AsmJitCompileExpr(ExprState *State) {
       AggState *aggstate = castNode(AggState, State->parent);
       AggStatePerTrans pertrans = op->d.agg_trans.pertrans;
       FunctionCallInfo fcinfo = pertrans->transfn_fcinfo;
-      x86::Gp v_aggstatep = emit_load_parent_from_ExprState(Jitcc, v_state);
-      x86::Gp v_pertransp =
-          EmitLoadConstUIntPtr(Jitcc, "v_pertransp.uintptr", pertrans);
+      arch::Gp v_aggstatep = emit_load_parent_from_ExprState(Jitcc, v_state);
+      arch::Gp v_pertransp =
+          EmitLoadConstUIntPtr(Jitcc, "v_pertransp", pertrans);
 
       /*
        * pergroup = &aggstate->all_pergroups
@@ -1734,36 +1664,36 @@ bool AsmJitCompileExpr(ExprState *State) {
        */
       int32 setoff = op->d.agg_trans.setoff;
       int32 transno = op->d.agg_trans.transno;
-      x86::Gp v_pergroupp = Jitcc.newUIntPtr("v_pergroupp.uintptr");
-      x86::Gp v_all_pergroupsp =
+      arch::Gp v_pergroupp = Jitcc.new_gp_ptr("v_pergroupp");
+      arch::Gp v_all_pergroupsp =
           emit_load_all_pergroups_from_AggState(Jitcc, v_aggstatep);
       EmitLoadFromArray(Jitcc, v_all_pergroupsp, setoff, v_pergroupp,
                         sizeof(AggStatePerGroup));
-      Jitcc.add(v_pergroupp, jit::imm(transno * sizeof(AggStatePerGroupData)));
+      EmitAddImm(Jitcc, v_pergroupp,
+                 (int64_t)transno * sizeof(AggStatePerGroupData));
 
       if (opcode == EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYVAL ||
           opcode == EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYREF) {
-        jit::Label L_NoInit = Jitcc.newLabel();
-        x86::Gp v_notransvalue =
+        jit::Label L_NoInit = Jitcc.new_label();
+        arch::Gp v_notransvalue =
             emit_load_noTransValue_from_AggStatePerGroupData(Jitcc,
                                                              v_pergroupp);
-        Jitcc.cmp(v_notransvalue, jit::imm(1));
-        Jitcc.jne(L_NoInit);
+        EmitCondJumpNE(Jitcc, v_notransvalue, 1, L_NoInit);
         {
           /* init the transition value if necessary */
-          x86::Gp v_aggcontext = EmitLoadConstUIntPtr(
-              Jitcc, "v_aggcontext.uintptr", op->d.agg_trans.aggcontext);
+          arch::Gp v_aggcontext = EmitLoadConstUIntPtr(
+              Jitcc, "v_aggcontext", op->d.agg_trans.aggcontext);
           jit::InvokeNode *InvokeExecAggInitGroup;
-          Jitcc.invoke(
-              &InvokeExecAggInitGroup, jit::imm(ExecAggInitGroup),
+          Jitcc.invoke(asmjit::Out(InvokeExecAggInitGroup),
+               JIT_FN_PTR(Jitcc, ExecAggInitGroup),
               jit::FuncSignature::build<void, AggState *, AggStatePerTrans,
                                         AggStatePerGroup, ExprContext *>());
-          InvokeExecAggInitGroup->setArg(0, v_aggstatep);
-          InvokeExecAggInitGroup->setArg(1, v_pertransp);
-          InvokeExecAggInitGroup->setArg(2, v_pergroupp);
-          InvokeExecAggInitGroup->setArg(3, v_aggcontext);
+          InvokeExecAggInitGroup->set_arg(0, v_aggstatep);
+          InvokeExecAggInitGroup->set_arg(1, v_pertransp);
+          InvokeExecAggInitGroup->set_arg(2, v_pergroupp);
+          InvokeExecAggInitGroup->set_arg(3, v_aggcontext);
 
-          Jitcc.jmp(L_opblocks[opno + 1]);
+          EmitJump(Jitcc, L_opblocks[opno + 1]);
         }
 
         Jitcc.bind(L_NoInit);
@@ -1773,17 +1703,16 @@ bool AsmJitCompileExpr(ExprState *State) {
           opcode == EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYREF ||
           opcode == EEOP_AGG_PLAIN_TRANS_STRICT_BYVAL ||
           opcode == EEOP_AGG_PLAIN_TRANS_STRICT_BYREF) {
-        x86::Gp v_transnull =
+        arch::Gp v_transnull =
             emit_load_transValueIsNull_from_AggStatePerGroupData(Jitcc,
                                                                  v_pergroupp);
-        Jitcc.cmp(v_transnull, jit::imm(1));
-        Jitcc.je(L_opblocks[opno + 1]);
+        EmitCondJumpEQ(Jitcc, v_transnull, 1, L_opblocks[opno + 1]);
       }
 
-      x86::Gp v_fcinfo =
-          EmitLoadConstUIntPtr(Jitcc, "v_fcinfo.uintptr", fcinfo);
-      x86::Gp v_aggcontext = EmitLoadConstUIntPtr(Jitcc, "v_aggcontext.uintptr",
-                                                  op->d.agg_trans.aggcontext);
+      arch::Gp v_fcinfo =
+          EmitLoadConstUIntPtr(Jitcc, "v_fcinfo", fcinfo);
+      arch::Gp v_aggcontext = EmitLoadConstUIntPtr(Jitcc, "v_aggcontext",
+                                                   op->d.agg_trans.aggcontext);
 
       /* set aggstate globals */
       {
@@ -1799,21 +1728,21 @@ bool AsmJitCompileExpr(ExprState *State) {
       emit_store_curpertrans_to_AggState(Jitcc, v_aggstatep, v_pertransp);
 
       /* invoke transition function in per-tuple context */
-      x86::Gp v_tmpcontext =
-          EmitLoadConstUIntPtr(Jitcc, "v_tmpcontext.uintptr",
+      arch::Gp v_tmpcontext =
+          EmitLoadConstUIntPtr(Jitcc, "v_tmpcontext",
                                aggstate->tmpcontext->ecxt_per_tuple_memory);
-      x86::Gp v_oldcontext = Jitcc.newUIntPtr("v_oldcontext.uintptr");
+      arch::Gp v_oldcontext = Jitcc.new_gp_ptr("v_oldcontext");
       jit::InvokeNode *InvokeMemoryContextSwitchTo;
-      Jitcc.invoke(&InvokeMemoryContextSwitchTo,
-                   jit::imm(MemoryContextSwitchTo),
+      Jitcc.invoke(asmjit::Out(InvokeMemoryContextSwitchTo),
+                   JIT_FN_PTR(Jitcc, MemoryContextSwitchTo),
                    jit::FuncSignature::build<MemoryContext, MemoryContext>());
-      InvokeMemoryContextSwitchTo->setArg(0, v_tmpcontext);
-      InvokeMemoryContextSwitchTo->setRet(0, v_oldcontext);
+      InvokeMemoryContextSwitchTo->set_arg(0, v_tmpcontext);
+      InvokeMemoryContextSwitchTo->set_ret(0, v_oldcontext);
 
       /* store transvalue in fcinfo->args[0] */
-      x86::Gp v_transvalue =
+      arch::Gp v_transvalue =
           emit_load_transValue_from_AggStatePerGroupData(Jitcc, v_pergroupp);
-      x86::Gp v_transnull =
+      arch::Gp v_transnull =
           emit_load_transValueIsNull_from_AggStatePerGroupData(Jitcc,
                                                                v_pergroupp);
       StoreFuncArgValue(Jitcc, v_fcinfo, 0, v_transvalue);
@@ -1821,13 +1750,13 @@ bool AsmJitCompileExpr(ExprState *State) {
       emit_store_isnull_to_FunctionCallInfoBaseData(Jitcc, v_fcinfo,
                                                     jit::imm(0));
 
-      x86::Gp v_retval = Jitcc.newUIntPtr("v_retval.uintptr");
+      arch::Gp v_retval = Jitcc.new_gp_ptr("v_retval");
       jit::InvokeNode *PGFunc;
-      Jitcc.invoke(&PGFunc, jit::imm(fcinfo->flinfo->fn_addr),
+      Jitcc.invoke(asmjit::Out(PGFunc), JIT_FN_PTR(Jitcc, fcinfo->flinfo->fn_addr),
                    jit::FuncSignature::build<Datum, FunctionCallInfo>());
-      PGFunc->setArg(0, v_fcinfo);
-      PGFunc->setRet(0, v_retval);
-      x86::Gp v_fcinfo_isnull =
+      PGFunc->set_arg(0, v_fcinfo);
+      PGFunc->set_ret(0, v_retval);
+      arch::Gp v_fcinfo_isnull =
           emit_load_isnull_from_FunctionCallInfoBaseData(Jitcc, v_fcinfo);
 
       /*
@@ -1842,14 +1771,13 @@ bool AsmJitCompileExpr(ExprState *State) {
       if (opcode == EEOP_AGG_PLAIN_TRANS_INIT_STRICT_BYREF ||
           opcode == EEOP_AGG_PLAIN_TRANS_STRICT_BYREF ||
           opcode == EEOP_AGG_PLAIN_TRANS_BYREF) {
-        jit::Label L_NoCall = Jitcc.newLabel();
-        x86::Gp v_transvalue =
+        jit::Label L_NoCall = Jitcc.new_label();
+        arch::Gp v_transvalue2 =
             emit_load_transValue_from_AggStatePerGroupData(Jitcc, v_pergroupp);
-        x86::Gp v_transnull =
+        arch::Gp v_transnull2 =
             emit_load_transValueIsNull_from_AggStatePerGroupData(Jitcc,
                                                                  v_pergroupp);
-        Jitcc.cmp(v_transvalue, v_retval);
-        Jitcc.je(L_NoCall);
+        EmitCondJumpRegEQ(Jitcc, v_transvalue2, v_retval, L_NoCall);
 
         /* store trans value */
         {
@@ -1857,25 +1785,25 @@ bool AsmJitCompileExpr(ExprState *State) {
            * FIXME: It's seems v_transvalue is not properly loaded in -O3 and I
            * don't know why.
            */
-          v_transvalue = emit_load_transValue_from_AggStatePerGroupData(
+          v_transvalue2 = emit_load_transValue_from_AggStatePerGroupData(
               Jitcc, v_pergroupp);
-          v_transnull = emit_load_transValueIsNull_from_AggStatePerGroupData(
+          v_transnull2 = emit_load_transValueIsNull_from_AggStatePerGroupData(
               Jitcc, v_pergroupp);
         }
 
         jit::InvokeNode *InvokeExecAggCopyTransValue;
-        x86::Gp v_newval = Jitcc.newUIntPtr("v_newval.uintptr");
-        Jitcc.invoke(
-            &InvokeExecAggCopyTransValue, jit::imm(ExecAggCopyTransValue),
+        arch::Gp v_newval = Jitcc.new_gp_ptr("v_newval");
+        Jitcc.invoke(asmjit::Out(InvokeExecAggCopyTransValue),
+             JIT_FN_PTR(Jitcc, ExecAggCopyTransValue),
             jit::FuncSignature::build<Datum, AggState *, AggStatePerTrans,
                                       Datum, bool, Datum, bool>());
-        InvokeExecAggCopyTransValue->setArg(0, v_aggstatep);
-        InvokeExecAggCopyTransValue->setArg(1, v_pertransp);
-        InvokeExecAggCopyTransValue->setArg(2, v_retval);
-        InvokeExecAggCopyTransValue->setArg(3, v_fcinfo_isnull);
-        InvokeExecAggCopyTransValue->setArg(4, v_transvalue);
-        InvokeExecAggCopyTransValue->setArg(5, v_transnull);
-        InvokeExecAggCopyTransValue->setRet(0, v_newval);
+        InvokeExecAggCopyTransValue->set_arg(0, v_aggstatep);
+        InvokeExecAggCopyTransValue->set_arg(1, v_pertransp);
+        InvokeExecAggCopyTransValue->set_arg(2, v_retval);
+        InvokeExecAggCopyTransValue->set_arg(3, v_fcinfo_isnull);
+        InvokeExecAggCopyTransValue->set_arg(4, v_transvalue2);
+        InvokeExecAggCopyTransValue->set_arg(5, v_transnull2);
+        InvokeExecAggCopyTransValue->set_ret(0, v_newval);
 
         /* store trans value */
         emit_store_transValue_to_AggStatePerGroupData(Jitcc, v_pergroupp,
@@ -1884,12 +1812,12 @@ bool AsmJitCompileExpr(ExprState *State) {
                                                             v_fcinfo_isnull);
 
         InvokeMemoryContextSwitchTo = nullptr;
-        Jitcc.invoke(&InvokeMemoryContextSwitchTo,
-                     jit::imm(MemoryContextSwitchTo),
+        Jitcc.invoke(asmjit::Out(InvokeMemoryContextSwitchTo),
+                     JIT_FN_PTR(Jitcc, MemoryContextSwitchTo),
                      jit::FuncSignature::build<MemoryContext, MemoryContext>());
-        InvokeMemoryContextSwitchTo->setArg(0, v_oldcontext);
+        InvokeMemoryContextSwitchTo->set_arg(0, v_oldcontext);
 
-        Jitcc.jmp(L_opblocks[opno + 1]);
+        EmitJump(Jitcc, L_opblocks[opno + 1]);
 
         Jitcc.bind(L_NoCall);
       }
@@ -1901,10 +1829,10 @@ bool AsmJitCompileExpr(ExprState *State) {
                                                           v_fcinfo_isnull);
 
       InvokeMemoryContextSwitchTo = nullptr;
-      Jitcc.invoke(&InvokeMemoryContextSwitchTo,
-                   jit::imm(MemoryContextSwitchTo),
+      Jitcc.invoke(asmjit::Out(InvokeMemoryContextSwitchTo),
+                   JIT_FN_PTR(Jitcc, MemoryContextSwitchTo),
                    jit::FuncSignature::build<MemoryContext, MemoryContext>());
-      InvokeMemoryContextSwitchTo->setArg(0, v_oldcontext);
+      InvokeMemoryContextSwitchTo->set_arg(0, v_oldcontext);
 
       break;
     }
@@ -1912,22 +1840,20 @@ bool AsmJitCompileExpr(ExprState *State) {
       AggState *aggstate = castNode(AggState, State->parent);
       AggStatePerTrans pertrans = op->d.agg_presorted_distinctcheck.pertrans;
       int jumpdistinct = op->d.agg_presorted_distinctcheck.jumpdistinct;
-      x86::Gp v_aggstatep =
-          EmitLoadConstUIntPtr(Jitcc, "v_aggstate.uintptr", aggstate);
-      x86::Gp v_pertrans =
-          EmitLoadConstUIntPtr(Jitcc, "v_pertrans.uintptr", pertrans);
-      x86::Gp v_retval = Jitcc.newInt8("v_retval.i8");
+      arch::Gp v_aggstatep =
+          EmitLoadConstUIntPtr(Jitcc, "v_aggstate", aggstate);
+      arch::Gp v_pertrans =
+          EmitLoadConstUIntPtr(Jitcc, "v_pertrans", pertrans);
+      arch::Gp v_retval = Jitcc.new_gp32("v_retval");
       jit::InvokeNode *InvokeExecEvalPreOrderedDistinctSingle;
-      Jitcc.invoke(
-          &InvokeExecEvalPreOrderedDistinctSingle,
-          jit::imm(ExecEvalPreOrderedDistinctSingle),
+      Jitcc.invoke(asmjit::Out(InvokeExecEvalPreOrderedDistinctSingle),
+          JIT_FN_PTR(Jitcc, ExecEvalPreOrderedDistinctSingle),
           jit::FuncSignature::build<bool, AggState *, AggStatePerTrans>());
-      InvokeExecEvalPreOrderedDistinctSingle->setArg(0, v_aggstatep);
-      InvokeExecEvalPreOrderedDistinctSingle->setArg(1, v_pertrans);
-      InvokeExecEvalPreOrderedDistinctSingle->setRet(0, v_retval);
+      InvokeExecEvalPreOrderedDistinctSingle->set_arg(0, v_aggstatep);
+      InvokeExecEvalPreOrderedDistinctSingle->set_arg(1, v_pertrans);
+      InvokeExecEvalPreOrderedDistinctSingle->set_ret(0, v_retval);
 
-      Jitcc.cmp(v_retval, 1);
-      Jitcc.jne(L_opblocks[jumpdistinct]);
+      EmitCondJumpNE(Jitcc, v_retval, 1, L_opblocks[jumpdistinct]);
 
       break;
     }
@@ -1935,22 +1861,20 @@ bool AsmJitCompileExpr(ExprState *State) {
       AggState *aggstate = castNode(AggState, State->parent);
       AggStatePerTrans pertrans = op->d.agg_presorted_distinctcheck.pertrans;
       int jumpdistinct = op->d.agg_presorted_distinctcheck.jumpdistinct;
-      x86::Gp v_aggstatep =
-          EmitLoadConstUIntPtr(Jitcc, "v_aggstate.uintptr", aggstate);
-      x86::Gp v_pertrans =
-          EmitLoadConstUIntPtr(Jitcc, "v_pertrans.uintptr", pertrans);
-      x86::Gp v_retval = Jitcc.newInt8("v_retval.i8");
+      arch::Gp v_aggstatep =
+          EmitLoadConstUIntPtr(Jitcc, "v_aggstate", aggstate);
+      arch::Gp v_pertrans =
+          EmitLoadConstUIntPtr(Jitcc, "v_pertrans", pertrans);
+      arch::Gp v_retval = Jitcc.new_gp32("v_retval");
       jit::InvokeNode *InvokeExecEvalPreOrderedDistinctMulti;
-      Jitcc.invoke(
-          &InvokeExecEvalPreOrderedDistinctMulti,
-          jit::imm(ExecEvalPreOrderedDistinctMulti),
+      Jitcc.invoke(asmjit::Out(InvokeExecEvalPreOrderedDistinctMulti),
+          JIT_FN_PTR(Jitcc, ExecEvalPreOrderedDistinctMulti),
           jit::FuncSignature::build<bool, AggState *, AggStatePerTrans>());
-      InvokeExecEvalPreOrderedDistinctMulti->setArg(0, v_aggstatep);
-      InvokeExecEvalPreOrderedDistinctMulti->setArg(1, v_pertrans);
-      InvokeExecEvalPreOrderedDistinctMulti->setRet(0, v_retval);
+      InvokeExecEvalPreOrderedDistinctMulti->set_arg(0, v_aggstatep);
+      InvokeExecEvalPreOrderedDistinctMulti->set_arg(1, v_pertrans);
+      InvokeExecEvalPreOrderedDistinctMulti->set_ret(0, v_retval);
 
-      Jitcc.cmp(v_retval, 1);
-      Jitcc.jne(L_opblocks[jumpdistinct]);
+      EmitCondJumpNE(Jitcc, v_retval, 1, L_opblocks[jumpdistinct]);
 
       break;
     }
@@ -1975,7 +1899,12 @@ bool AsmJitCompileExpr(ExprState *State) {
     }
   }
 
-  Jitcc.finalize();
+  jit::Error finalize_err = Jitcc.finalize();
+  if (finalize_err != jit::kErrorOk) {
+    ereport(LOG, (errmsg("AsmJit finalize failed: %s",
+                         jit::DebugUtils::error_as_string(finalize_err))));
+    return false;
+  }
 
   ExprStateEvalFunc EvalFunc =
       (ExprStateEvalFunc)EmitJittedFunction(Context, Code);
@@ -2000,9 +1929,9 @@ void *EmitJittedFunction(AsmJitContext *Context, jit::CodeHolder &Code) {
   void *EmittedFunc;
   INSTR_TIME_SET_CURRENT(CodeEmissionStartTime);
   jit::Error err = Runtime.add(&EmittedFunc, &Code);
-  if (err) {
+  if (err != jit::kErrorOk) {
     ereport(LOG,
-            (errmsg("Jit failed: %s", jit::DebugUtils::errorAsString(err))));
+            (errmsg("Jit failed: %s", jit::DebugUtils::error_as_string(err))));
     return nullptr;
   }
   INSTR_TIME_SET_CURRENT(CodeEmissionEndTime);

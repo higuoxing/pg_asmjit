@@ -1,11 +1,14 @@
 MODULE_big = asmjit
 PROJ_ROOT_DIR := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 
-ASMJIT_SRCS = $(wildcard $(PROJ_ROOT_DIR)/deps/asmjit/src/*/*/*.cpp)
+ASMJIT_SRCS = $(wildcard $(PROJ_ROOT_DIR)/deps/asmjit/asmjit/*/*.cpp)
 OBJS = asmjit.o asmjit_deform.o asmjit_expr.o
 OBJS += $(ASMJIT_SRCS:.cpp=.o)
 
-PG_CPPFLAGS += -Ideps/asmjit/src
+# Headers live under deps/asmjit/asmjit/, so include deps/asmjit so that
+# <asmjit/...> resolves correctly.  Keep deps/asmjit/src for backward
+# compatibility with any remaining out-of-tree object files.
+PG_CPPFLAGS += -Ideps/asmjit -Ideps/asmjit/src
 
 # libasmjit is built in the `build` dir.
 EXTRA_CLEAN = build

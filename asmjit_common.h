@@ -48,121 +48,50 @@ TupleDeformingFunc CompileTupleDeformingFunc(AsmJitContext *Context,
                                              int NAttrs);
 }
 
-#define TYPES_INFO(struct_type, member_type, member_name, reg_type)            \
-  static inline jit::x86::Gp emit_load_##member_name##_from_##struct_type(     \
-      jit::x86::Compiler &cc, jit::x86::Gp &object_addr) {                     \
-    jit::x86::Mem member_ptr = jit::x86::ptr(                                  \
-        object_addr, offsetof(struct_type, member_name), sizeof(member_type)); \
-    jit::x86::Gp member = cc.new##reg_type(#struct_type "_" #member_name);     \
-    cc.mov(member, member_ptr);                                                \
-    return member;                                                             \
-  }                                                                            \
-  template <typename Op>                                                       \
-  static inline void emit_store_##member_name##_to_##struct_type(              \
-      jit::x86::Compiler &cc, jit::x86::Gp &object_addr, Op &&val) {           \
-    jit::x86::Mem member_ptr = jit::x86::ptr(                                  \
-        object_addr, offsetof(struct_type, member_name), sizeof(member_type)); \
-    cc.mov(member_ptr, val);                                                   \
-  }
-#include "jit_types_info.inc"
-#undef TYPES_INFO
-
-#define LOAD_STORE_CONST(CType, JitType)                                       \
-  static inline jit::x86::Gp EmitLoadConst##JitType(                           \
-      jit::x86::Compiler &cc, const char *fmt, CType c) {                      \
-    jit::x86::Gp JitReg = cc.new##JitType(fmt);                                \
-    cc.mov(JitReg, jit::imm(c));                                               \
-    return JitReg;                                                             \
-  }
-LOAD_STORE_CONST(uint8, UInt8)
-LOAD_STORE_CONST(int8, Int8)
-LOAD_STORE_CONST(uint32, UInt32)
-LOAD_STORE_CONST(int32, Int32)
-LOAD_STORE_CONST(void *, UIntPtr)
-LOAD_STORE_CONST(intptr_t, IntPtr)
-LOAD_STORE_CONST(uint64, UInt64)
-LOAD_STORE_CONST(int64, Int64)
-#undef LOAD_STORE_CONST
-
-static inline void EmitLoadFromArray(jit::x86::Compiler &cc,
-                                     jit::x86::Gp &Array, size_t Index,
-                                     jit::x86::Gp &Elem, size_t ElemSize) {
-  jit::x86::Mem ElemPtr = jit::x86::ptr(Array, Index * ElemSize, ElemSize);
-  cc.mov(Elem, ElemPtr);
-}
-
-template <typename T>
-static inline void EmitStoreToArray(jit::x86::Compiler &cc, jit::x86::Gp &Array,
-                                    size_t Index, const T &Elem,
-                                    size_t ElemSize) {
-  jit::x86::Mem ElemPtr = jit::x86::ptr(Array, Index * ElemSize, ElemSize);
-  cc.mov(ElemPtr, Elem);
-}
-
-/* TODO: Combine with EmitLoadFromArray. */
-static inline void EmitLoadFromFlexibleArray(jit::x86::Compiler &cc,
-                                             jit::x86::Gp &ObjectAddr,
-                                             size_t ArrayOff, size_t Index,
-                                             jit::x86::Gp &Elem,
-                                             size_t ElemSize) {
-  jit::x86::Mem ElemPtr =
-      jit::x86::ptr(ObjectAddr, ArrayOff + Index * ElemSize, ElemSize);
-  cc.mov(Elem, ElemPtr);
-}
-
-template <typename T>
-static inline void EmitStoreToFlexibleArray(jit::x86::Compiler &cc,
-                                            jit::x86::Gp &ObjectAddr,
-                                            size_t ArrayOff, size_t Index,
-                                            const T &Elem, size_t ElemSize) {
-  jit::x86::Mem ElemPtr =
-      jit::x86::ptr(ObjectAddr, ArrayOff + Index * ElemSize, ElemSize);
-  cc.mov(ElemPtr, Elem);
-}
-
-static inline jit::x86::Gp
-LoadFuncArgNull(jit::x86::Compiler &cc, jit::x86::Gp &v_fcinfo, size_t argno) {
-  jit::x86::Gp v_argnull = cc.newInt8("v_argnull.i8");
-  EmitLoadFromFlexibleArray(cc, v_fcinfo,
-                            offsetof(FunctionCallInfoBaseData, args) +
-                                argno * sizeof(NullableDatum) +
-                                offsetof(NullableDatum, isnull),
-                            0, v_argnull, sizeof(bool));
-  return v_argnull;
-}
-
-static inline jit::x86::Gp LoadFuncArgValue(jit::x86::Compiler &cc,
-                                            jit::x86::Gp &v_funcinfo,
-                                            size_t argno) {
-  jit::x86::Gp v_argvalue = cc.newUIntPtr("v_argvalue.uintptr");
-  EmitLoadFromFlexibleArray(cc, v_funcinfo,
-                            offsetof(FunctionCallInfoBaseData, args) +
-                                argno * sizeof(NullableDatum) +
-                                offsetof(NullableDatum, value),
-                            0, v_argvalue, sizeof(Datum));
-  return v_argvalue;
-}
-
-template <typename T>
-static inline void StoreFuncArgNull(jit::x86::Compiler &cc,
-                                    jit::x86::Gp &v_fcinfo, size_t argno,
-                                    const T &v_val) {
-  EmitStoreToFlexibleArray(cc, v_fcinfo,
-                           offsetof(FunctionCallInfoBaseData, args) +
-                               argno * sizeof(NullableDatum) +
-                               offsetof(NullableDatum, isnull),
-                           0, v_val, sizeof(bool));
-}
-
-template <typename T>
-static inline void StoreFuncArgValue(jit::x86::Compiler &cc,
-                                     jit::x86::Gp &v_fcinfo, size_t argno,
-                                     const T &v_val) {
-  EmitStoreToFlexibleArray(cc, v_fcinfo,
-                           offsetof(FunctionCallInfoBaseData, args) +
-                               argno * sizeof(NullableDatum) +
-                               offsetof(NullableDatum, value),
-                           0, v_val, sizeof(Datum));
-}
-
+/*
+ * Include the architecture-specific emit helpers.  These define:
+ *   - namespace arch (= asmjit::x86 or asmjit::a64)
+ *   - All TYPES_INFO-based emit_load/emit_store helpers
+ *   - EmitLoadConst* helpers
+ *   - EmitLoadFromArray / EmitStoreToArray / EmitLoadFromFlexibleArray /
+ *     EmitStoreToFlexibleArray
+ *   - LoadFuncArgNull / LoadFuncArgValue / StoreFuncArgNull / StoreFuncArgValue
+ *   - EmitCondJumpEQ/NE/GE/LE/GT/RegEQ/RegNE, EmitJump
+ *   - EmitSetEQ/LT/LE/GT/GE
+ *   - EmitZero, EmitBitwiseOr/And/AndImm/Xor
+ *   - EmitAddImm/AddReg, EmitInc
+ *   - EmitShlImm/ShrImm
+ *   - EmitZeroExtend8/16/32to64, EmitSignExtend8to64/16to32/32to64
+ */
+#if defined(__aarch64__) || defined(_M_ARM64)
+#include "asmjit_a64_common.h"
+#else
+#include "asmjit_x86_common.h"
 #endif
+
+/*
+ * JIT_FN_PTR(cc, fn) — architecture-aware function-address operand.
+ *
+ * On x86/x86-64, AsmJit can encode CALL/JMP with a 32-bit PC-relative
+ * displacement and handles absolute-to-relative relocations automatically,
+ * so passing jit::imm(fn) directly to invoke() is fine.
+ *
+ * On AArch64, the BLR (branch-link-register) instruction only accepts a
+ * 64-bit GP register operand.  AsmJit's a64::Compiler invoke() uses kIdBlr
+ * for all calls, so if the target operand is an Imm the assembler rejects it
+ * with kInvalidInstruction.  We therefore pre-load the function address into
+ * a scratch GP register and pass that register to invoke().
+ */
+#if defined(__aarch64__) || defined(_M_ARM64)
+static inline arch::Gp JitFnAddr(arch::Compiler &cc, void *fn) {
+  arch::Gp r = cc.new_gp_ptr("fn_addr");
+  cc.mov(r, asmjit::imm((uintptr_t)fn));
+  return r;
+}
+#define JIT_FN_PTR(cc_, fn_) JitFnAddr((cc_), (void *)(uintptr_t)(fn_))
+#else
+/* x86: pass the address as an immediate; AsmJit handles the relocation. */
+#define JIT_FN_PTR(cc_, fn_) jit::imm(fn_)
+#endif
+
+#endif /* _PG_ASMJIT_H_ */
