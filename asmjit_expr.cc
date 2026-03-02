@@ -6,6 +6,7 @@ namespace x86 = asmjit::x86;
 extern "C" {
 
 static bool JitSessionInitialized = false;
+static bool JitArchSupported = false;
 static jit::JitRuntime Runtime;
 
 static void ResOwnerReleaseJitContext(Datum res) {
@@ -65,6 +66,16 @@ static void JitInitializeSession(void) {
     return;
 
   JitSessionInitialized = true;
+
+  /*
+   * pg_asmjit only has an x86/x86-64 backend. Decline to JIT on any other
+   * architecture rather than emitting x86 machine code and crashing when it
+   * is executed on the host CPU.
+   */
+  jit::Arch arch = Runtime.environment().arch();
+  JitArchSupported = (arch == jit::Arch::kX86 || arch == jit::Arch::kX64);
+  if (!JitArchSupported)
+    elog(LOG, "pg_asmjit: unsupported architecture, JIT disabled");
 }
 
 static AsmJitContext *JitCreateContext(int JitFlags) {
@@ -107,6 +118,11 @@ bool AsmJitCompileExpr(ExprState *State) {
    * we need access to the EState.
    */
   Assert(Parent);
+
+  /* Initialize session and check architecture support */
+  JitInitializeSession();
+  if (!JitArchSupported)
+    return false;
 
   /* get or create JIT context */
   if (Parent->state->es_jit) {
@@ -171,7 +187,7 @@ bool AsmJitCompileExpr(ExprState *State) {
   } while (0);
 
     switch (opcode) {
-    case EEOP_DONE: {
+    case EEOP_DONE_RETURN: {
       /* Load expression->resvalue and expression->resnull */
       x86::Gp v_resvalue = emit_load_resvalue_from_ExprState(Jitcc, v_state),
               v_resnull = emit_load_resnull_from_ExprState(Jitcc, v_state);
@@ -1190,7 +1206,7 @@ bool AsmJitCompileExpr(ExprState *State) {
     }
 
     case EEOP_ROWCOMPARE_FINAL: {
-      RowCompareType rctype = op->d.rowcompare_final.rctype;
+      CompareType rctype = op->d.rowcompare_final.cmptype;
 
       /*
        * Btree comparators return 32 bit results, need to be
@@ -1208,16 +1224,16 @@ bool AsmJitCompileExpr(ExprState *State) {
       Jitcc.cmp(v_cmpop, jit::imm(0));
 
       switch (rctype) {
-      case ROWCOMPARE_LT:
+      case COMPARE_LT:
         Jitcc.setl(v_cmpresult);
         break;
-      case ROWCOMPARE_LE:
+      case COMPARE_LE:
         Jitcc.setle(v_cmpresult);
         break;
-      case ROWCOMPARE_GT:
+      case COMPARE_GT:
         Jitcc.setg(v_cmpresult);
         break;
-      case ROWCOMPARE_GE:
+      case COMPARE_GE:
         Jitcc.setge(v_cmpresult);
         break;
       default:

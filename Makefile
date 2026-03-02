@@ -16,6 +16,13 @@ override COMPILER = $(CXX) $(CFLAGS)
 # Disable the bitcode generation.
 override with_llvm = no
 
-PG_CONFIG := pg_config
+ifdef USE_PGXS
+PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
+else
+subdir = contrib/pg_asmjit
+top_builddir = ../..
+include $(top_builddir)/src/Makefile.global
+include $(top_srcdir)/contrib/contrib-global.mk
+endif
