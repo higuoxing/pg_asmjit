@@ -192,9 +192,20 @@ bool AsmJitCompileExpr(ExprState *State) {
       Jitcc.end_func();
       break;
     }
+
+    case EEOP_DONE_NO_RETURN: {
+      /* Return a zero datum; the caller ignores the return value. */
+      arch::Gp v_zero = Jitcc.new_gp_ptr("v_zero");
+      EmitZero(Jitcc, v_zero);
+      Jitcc.ret(v_zero);
+      Jitcc.end_func();
+      break;
+    }
     case EEOP_INNER_FETCHSOME:
     case EEOP_OUTER_FETCHSOME:
-    case EEOP_SCAN_FETCHSOME: {
+    case EEOP_SCAN_FETCHSOME:
+    case EEOP_OLD_FETCHSOME:
+    case EEOP_NEW_FETCHSOME: {
       const TupleTableSlotOps *tts_ops =
           op->d.fetch.fixed ? op->d.fetch.kind : nullptr;
       TupleDesc desc = op->d.fetch.known_desc;
@@ -210,8 +221,14 @@ bool AsmJitCompileExpr(ExprState *State) {
               : (opcode == EEOP_OUTER_FETCHSOME
                      ? emit_load_ecxt_outertuple_from_ExprContext(Jitcc,
                                                                   v_econtext)
-                     : emit_load_ecxt_scantuple_from_ExprContext(Jitcc,
-                                                                 v_econtext));
+                     : (opcode == EEOP_OLD_FETCHSOME
+                            ? emit_load_ecxt_oldtuple_from_ExprContext(Jitcc,
+                                                                       v_econtext)
+                            : (opcode == EEOP_NEW_FETCHSOME
+                                   ? emit_load_ecxt_newtuple_from_ExprContext(
+                                         Jitcc, v_econtext)
+                                   : emit_load_ecxt_scantuple_from_ExprContext(
+                                         Jitcc, v_econtext))));
 
       arch::Gp v_nvalid =
           emit_load_tts_nvalid_from_TupleTableSlot(Jitcc, v_slot);
@@ -252,15 +269,23 @@ bool AsmJitCompileExpr(ExprState *State) {
 
     case EEOP_INNER_VAR:
     case EEOP_OUTER_VAR:
-    case EEOP_SCAN_VAR: {
+    case EEOP_SCAN_VAR:
+    case EEOP_OLD_VAR:
+    case EEOP_NEW_VAR: {
       arch::Gp v_slot =
           opcode == EEOP_INNER_VAR
               ? emit_load_ecxt_innertuple_from_ExprContext(Jitcc, v_econtext)
               : (opcode == EEOP_OUTER_VAR
                      ? emit_load_ecxt_outertuple_from_ExprContext(Jitcc,
                                                                   v_econtext)
-                     : emit_load_ecxt_scantuple_from_ExprContext(Jitcc,
-                                                                 v_econtext));
+                     : (opcode == EEOP_OLD_VAR
+                            ? emit_load_ecxt_oldtuple_from_ExprContext(Jitcc,
+                                                                       v_econtext)
+                            : (opcode == EEOP_NEW_VAR
+                                   ? emit_load_ecxt_newtuple_from_ExprContext(
+                                         Jitcc, v_econtext)
+                                   : emit_load_ecxt_scantuple_from_ExprContext(
+                                         Jitcc, v_econtext))));
 
       arch::Gp v_values =
                   emit_load_tts_values_from_TupleTableSlot(Jitcc, v_slot),
@@ -285,15 +310,23 @@ bool AsmJitCompileExpr(ExprState *State) {
     }
     case EEOP_INNER_SYSVAR:
     case EEOP_OUTER_SYSVAR:
-    case EEOP_SCAN_SYSVAR: {
+    case EEOP_SCAN_SYSVAR:
+    case EEOP_OLD_SYSVAR:
+    case EEOP_NEW_SYSVAR: {
       arch::Gp v_slot =
-          opcode == EEOP_INNER_VAR
+          opcode == EEOP_INNER_SYSVAR
               ? emit_load_ecxt_innertuple_from_ExprContext(Jitcc, v_econtext)
               : (opcode == EEOP_OUTER_SYSVAR
                      ? emit_load_ecxt_outertuple_from_ExprContext(Jitcc,
                                                                   v_econtext)
-                     : emit_load_ecxt_scantuple_from_ExprContext(Jitcc,
-                                                                 v_econtext));
+                     : (opcode == EEOP_OLD_SYSVAR
+                            ? emit_load_ecxt_oldtuple_from_ExprContext(Jitcc,
+                                                                       v_econtext)
+                            : (opcode == EEOP_NEW_SYSVAR
+                                   ? emit_load_ecxt_newtuple_from_ExprContext(
+                                         Jitcc, v_econtext)
+                                   : emit_load_ecxt_scantuple_from_ExprContext(
+                                         Jitcc, v_econtext))));
 
       jit::InvokeNode *ExecEvalSysVarFunc;
       Jitcc.invoke(asmjit::Out(ExecEvalSysVarFunc),
@@ -314,15 +347,23 @@ bool AsmJitCompileExpr(ExprState *State) {
 
     case EEOP_ASSIGN_INNER_VAR:
     case EEOP_ASSIGN_OUTER_VAR:
-    case EEOP_ASSIGN_SCAN_VAR: {
+    case EEOP_ASSIGN_SCAN_VAR:
+    case EEOP_ASSIGN_OLD_VAR:
+    case EEOP_ASSIGN_NEW_VAR: {
       arch::Gp v_slot =
           opcode == EEOP_ASSIGN_INNER_VAR
               ? emit_load_ecxt_innertuple_from_ExprContext(Jitcc, v_econtext)
               : (opcode == EEOP_ASSIGN_OUTER_VAR
                      ? emit_load_ecxt_outertuple_from_ExprContext(Jitcc,
                                                                   v_econtext)
-                     : emit_load_ecxt_scantuple_from_ExprContext(Jitcc,
-                                                                 v_econtext));
+                     : (opcode == EEOP_ASSIGN_OLD_VAR
+                            ? emit_load_ecxt_oldtuple_from_ExprContext(Jitcc,
+                                                                       v_econtext)
+                            : (opcode == EEOP_ASSIGN_NEW_VAR
+                                   ? emit_load_ecxt_newtuple_from_ExprContext(
+                                         Jitcc, v_econtext)
+                                   : emit_load_ecxt_scantuple_from_ExprContext(
+                                         Jitcc, v_econtext))));
 
       arch::Gp v_values =
                   emit_load_tts_values_from_TupleTableSlot(Jitcc, v_slot),
@@ -835,6 +876,21 @@ bool AsmJitCompileExpr(ExprState *State) {
       }
       break;
     }
+
+    case EEOP_CASE_TESTVAL_EXT: {
+      /* Always reads from econtext->caseValue_datum/isNull (no pointer). */
+      arch::Gp v_resvaluep =
+                  EmitLoadConstUIntPtr(Jitcc, "v_resvaluep", op->resvalue),
+               v_resnullp =
+                   EmitLoadConstUIntPtr(Jitcc, "v_resnullp", op->resnull);
+      arch::Gp v_casevalue =
+          emit_load_caseValue_datum_from_ExprContext(Jitcc, v_econtext);
+      arch::Gp v_casenull =
+          emit_load_caseValue_isNull_from_ExprContext(Jitcc, v_econtext);
+      EmitStoreToArray(Jitcc, v_resvaluep, 0, v_casevalue, sizeof(Datum));
+      EmitStoreToArray(Jitcc, v_resnullp, 0, v_casenull, sizeof(bool));
+      break;
+    }
     case EEOP_MAKE_READONLY: {
       arch::Gp v_nullp =
           EmitLoadConstUIntPtr(Jitcc, "v_nullp", op->d.make_readonly.isnull);
@@ -1085,6 +1141,36 @@ bool AsmJitCompileExpr(ExprState *State) {
       break;
     }
 
+    case EEOP_RETURNINGEXPR: {
+      /*
+       * If the OLD/NEW row doesn't exist (flagged by ExprState->flags &
+       * nullflag), store a NULL result and jump to jumpdone; otherwise
+       * fall through to the next op to evaluate the expression normally.
+       */
+      arch::Gp v_flags =
+          emit_load_flags_from_ExprState(Jitcc, v_state);
+      EmitBitwiseAndImm(Jitcc, v_flags,
+                        (int64_t)(uint64_t)op->d.returningexpr.nullflag);
+
+      jit::Label L_notnull = Jitcc.new_label();
+      EmitCondJumpEQ(Jitcc, v_flags, 0, L_notnull);
+
+      /* OLD/NEW row is NULL: write NULL result then jump to jumpdone. */
+      arch::Gp v_resvaluep =
+                  EmitLoadConstUIntPtr(Jitcc, "v_resvaluep", op->resvalue),
+               v_resnullp =
+                   EmitLoadConstUIntPtr(Jitcc, "v_resnullp", op->resnull);
+      arch::Gp v_zero = Jitcc.new_gp_ptr("v_zero");
+      arch::Gp v_true = EmitLoadConstInt32(Jitcc, "v_true", 1);
+      EmitZero(Jitcc, v_zero);
+      EmitStoreToArray(Jitcc, v_resvaluep, 0, v_zero, sizeof(Datum));
+      EmitStoreToArray(Jitcc, v_resnullp, 0, v_true, sizeof(bool));
+      EmitJump(Jitcc, L_opblocks[op->d.returningexpr.jumpdone]);
+
+      Jitcc.bind(L_notnull);
+      break;
+    }
+
     case EEOP_ARRAYEXPR: {
       BuildEvalXFunc2(ExecEvalArrayExpr);
       break;
@@ -1233,6 +1319,21 @@ bool AsmJitCompileExpr(ExprState *State) {
       break;
     }
 
+    case EEOP_DOMAIN_TESTVAL_EXT: {
+      /* Always reads from econtext->domainValue_datum/isNull (no pointer). */
+      arch::Gp v_resvaluep =
+                  EmitLoadConstUIntPtr(Jitcc, "v_resvaluep", op->resvalue),
+               v_resnullp =
+                   EmitLoadConstUIntPtr(Jitcc, "v_resnullp", op->resnull);
+      arch::Gp v_casevalue =
+          emit_load_domainValue_datum_from_ExprContext(Jitcc, v_econtext);
+      arch::Gp v_casenull =
+          emit_load_domainValue_isNull_from_ExprContext(Jitcc, v_econtext);
+      EmitStoreToArray(Jitcc, v_resvaluep, 0, v_casevalue, sizeof(Datum));
+      EmitStoreToArray(Jitcc, v_resnullp, 0, v_casenull, sizeof(bool));
+      break;
+    }
+
     case EEOP_DOMAIN_NOTNULL: {
       BuildEvalXFunc2(ExecEvalConstraintNotNull);
       break;
@@ -1272,9 +1373,13 @@ bool AsmJitCompileExpr(ExprState *State) {
        * away the hash value and return NULL.
        */
       if (opcode == EEOP_HASHDATUM_NEXT32) {
-        arch::Gp v_resvaluep =
-            EmitLoadConstUIntPtr(Jitcc, "v_resvaluep", op->resvalue);
-        EmitLoadFromArray(Jitcc, v_resvaluep, 0, v_prevhash, sizeof(Datum));
+        /*
+         * Read the intermediate hash result from op->d.hashdatum.iresult->value,
+         * which points to the FIRST step's NullableDatum (not this step's resvalue).
+         */
+        arch::Gp v_iresultp =
+            EmitLoadConstUIntPtr(Jitcc, "v_iresultp", &op->d.hashdatum.iresult->value);
+        EmitLoadFromArray(Jitcc, v_iresultp, 0, v_prevhash, sizeof(Datum));
 
         /*
          * Rotate bits left by 1 bit.  Be careful not to
@@ -1299,9 +1404,12 @@ bool AsmJitCompileExpr(ExprState *State) {
       {
         /* If not null. */
         if (opcode == EEOP_HASHDATUM_NEXT32_STRICT) {
-          arch::Gp v_resvaluep =
-              EmitLoadConstUIntPtr(Jitcc, "v_resvaluep", op->resvalue);
-          EmitLoadFromArray(Jitcc, v_resvaluep, 0, v_prevhash, sizeof(Datum));
+          /*
+           * Read the intermediate hash result from op->d.hashdatum.iresult->value.
+           */
+          arch::Gp v_iresultp =
+              EmitLoadConstUIntPtr(Jitcc, "v_iresultp", &op->d.hashdatum.iresult->value);
+          EmitLoadFromArray(Jitcc, v_iresultp, 0, v_prevhash, sizeof(Datum));
 
           arch::Gp v_tmp = Jitcc.new_gp64("v_tmp");
           Jitcc.mov(v_tmp, v_prevhash);
@@ -1600,6 +1708,7 @@ bool AsmJitCompileExpr(ExprState *State) {
     }
 
     case EEOP_AGG_STRICT_INPUT_CHECK_ARGS:
+    case EEOP_AGG_STRICT_INPUT_CHECK_ARGS_1:
     case EEOP_AGG_STRICT_INPUT_CHECK_NULLS: {
       int nargs = op->d.agg_strict_input_check.nargs;
       NullableDatum *args = op->d.agg_strict_input_check.args;
